@@ -49,3 +49,4 @@ docker/.env
 *.mp4
 *.avi
 recordings/
+output/

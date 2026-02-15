@@ -38,11 +38,13 @@ Total VRAM on Vast.ai: ~16-19GB (LLM 6-7GB + TTS 3-4GB + MuseTalk 4-6GB). Fits c
 ### Stage 1: Voice Clone Proof-of-Concept
 
 1. **Record voice samples**: 3-5 minutes of clean speech. Use a Python script with `sounddevice` to record 16kHz WAV files. Read a diverse script covering different intonations, emotions, and sentence structures. Record in a quiet room.
-2. **Deploy Fish Speech v1.5** on Vast.ai. Add Fish Speech dependencies to the Docker image and redeploy. Fish Speech is chosen over alternatives because:
-   - Excellent zero-shot cloning from short reference audio
-   - Native multilingual support (English + Ukrainian)
-   - Streaming output support (~400ms to first chunk on RTX 4090)
-   - Active open-source project with good documentation
+2. **Deploy OpenAudio S1-mini** (Fish Speech successor) on Vast.ai. Use the official Fish Speech Docker image (`fishaudio/fish-speech:latest-server-cuda`) or add dependencies to our image. S1-mini chosen over alternatives because:
+   - #1 on TTS-Arena2, best open-source TTS quality (WER 0.008, CER 0.004)
+   - Zero-shot voice cloning from 10-30s reference audio
+   - Streaming output support (RTF ~1:7 on RTX 4090)
+   - 0.5B params, ~2-3GB VRAM — fits alongside LLM + MuseTalk
+   - Emotion control via markers (50+ emotions, tone control)
+   - Active open-source project (24.9k stars), Apache-2.0 code
 3. **Test voice cloning**: Send text + reference audio clip → receive synthesized audio. Compare quality. Iterate on reference clips if needed.
 4. **Fine-tune** (optional at this stage): If zero-shot quality isn't convincing enough, fine-tune Fish Speech on your full recording set for a tighter voice match.
 5. **Verification**: Play synthesized audio to someone who knows your voice. They should recognize it as "you" (or at least "close to you"). Test both English and Ukrainian if relevant.
@@ -126,7 +128,7 @@ Total VRAM on Vast.ai: ~16-19GB (LLM 6-7GB + TTS 3-4GB + MuseTalk 4-6GB). Fits c
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| TTS | Fish Speech v1.5 | Best multilingual (EN + UK), streaming support, strong zero-shot cloning |
+| TTS | OpenAudio S1-mini (0.5B) | #1 TTS-Arena2, streaming, zero-shot cloning, 2-3GB VRAM, emotion control |
 | LLM | MamayLM (Gemma 2 9B, 4-bit) | SOTA Ukrainian (beats 10x larger models), strong English, fine-tunable with QLoRA |
 | Face Animation | MuseTalk | Only real-time option at sufficient quality (~30 FPS); LivePortrait as future upgrade |
 | ASR | faster-whisper large-v3-turbo + Silero VAD | Runs locally on RTX 3060 Windows (2GB VRAM), saves ~100ms network hop |
@@ -157,7 +159,7 @@ Total VRAM on Vast.ai: ~16-19GB (LLM 6-7GB + TTS 3-4GB + MuseTalk 4-6GB). Fits c
 | Voice Activity Detection | Silero VAD | Local (CPU) | 0 |
 | Speech-to-Text | faster-whisper large-v3-turbo | Local (GPU) | ~2GB |
 | LLM | MamayLM (Gemma 2 9B, 4-bit) via vLLM | Vast.ai | ~6-7GB |
-| Text-to-Speech | Fish Speech v1.5 | Vast.ai | ~3-4GB |
+| Text-to-Speech | OpenAudio S1-mini (0.5B) | Vast.ai | ~2-3GB |
 | Face Animation | MuseTalk | Vast.ai | ~4-6GB |
 | Virtual Camera | pyvirtualcam + OBS Virtual Camera | Local | 0 |
 | Virtual Microphone | VB-Audio Virtual Cable + sounddevice | Local | 0 |
