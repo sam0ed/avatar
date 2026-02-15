@@ -28,6 +28,7 @@ import sys
 
 IMAGE = "fishaudio/fish-speech:server-cuda"
 DISK = "50"
+BLOCKED_REGIONS = {"CN", "RU"}
 
 
 def get_hf_token() -> str:
@@ -49,7 +50,7 @@ def search_offers() -> str | None:
         [
             "vastai", "search", "offers",
             "gpu_name=RTX_4090 num_gpus=1 reliability>0.95 disk_space>=50",
-            "-o", "dph+", "--limit", "5", "--raw",
+            "-o", "dph+", "--limit", "20", "--raw",
         ],
         capture_output=True,
         text=True,
@@ -59,11 +60,16 @@ def search_offers() -> str | None:
         return None
 
     offers = json.loads(result.stdout)
+    # Filter out blocked regions (China, Russia, etc.)
+    offers = [
+        o for o in offers
+        if o.get("geolocation", "").split(",")[-1].strip() not in BLOCKED_REGIONS
+    ]
     if not offers:
-        print("No offers found!", file=sys.stderr)
+        print("No offers found (after filtering blocked regions)!", file=sys.stderr)
         return None
 
-    print("\nAvailable RTX 4090 offers:")
+    print("\nAvailable RTX 4090 offers (excluding blocked regions):")
     for o in offers:
         print(
             f"  ID {o['id']:>10}  ${o['dph_total']:.3f}/hr  "

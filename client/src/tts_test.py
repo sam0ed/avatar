@@ -265,8 +265,8 @@ def main() -> None:
     parser.add_argument(
         "--output", "-o",
         type=Path,
-        default=Path("output/tts_test.wav"),
-        help="Output file path (default: output/tts_test.wav)",
+        default=Path(__file__).resolve().parents[2] / "output" / "tts_test.wav",
+        help="Output file path (default: <project_root>/output/tts_test.wav)",
     )
     parser.add_argument(
         "--play",
