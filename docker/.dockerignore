@@ -1,0 +1,13 @@
+# Docker ignore for avatar server builds
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.git/
+.gitignore
+models/
+client/
+scripts/
+*.md
+.github/
