@@ -1,10 +1,8 @@
-# Stage 0: Minimal base image with Python 3.11 + uv + PyTorch (CUDA 12.1)
-# Later stages add: vLLM, Fish Speech, MuseTalk
+# Avatar server — slim image with Python 3.11 + uv
+# GPU libraries (PyTorch, etc.) come via pre-compiled wheels, no CUDA toolkit needed.
+# Later stages add: vLLM, Fish Speech, MuseTalk as pip/uv dependencies.
 
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
-
-# Avoid interactive prompts during apt install
-ENV DEBIAN_FRONTEND=noninteractive
+FROM python:3.11-slim-bookworm
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,15 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Python 3.11
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-venv \
-    python3.11-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
