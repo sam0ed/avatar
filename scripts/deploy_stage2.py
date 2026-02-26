@@ -61,6 +61,8 @@ def build_onstart_cmd() -> str:
         Shell command string (~750 chars, well under Vast.ai 4048 limit).
     """
     steps = [
+        # 0. Fix SSH permissions (Vast.ai creates authorized_keys with wrong modes)
+        "chmod 700 /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; true",
         # 1. System deps
         "apt-get update -qq && apt-get install -y -qq supervisor git",
         # 2. LLM venv + deps (pre-built CUDA wheel, no nvcc needed)

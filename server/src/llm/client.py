@@ -51,8 +51,27 @@ class ChatSession:
         self.messages.append(ChatMessage(role="assistant", content=content))
 
     def to_api_format(self) -> list[dict[str, str]]:
-        """Convert to the format expected by the OpenAI-compatible API."""
-        return [{"role": m.role, "content": m.content} for m in self.messages]
+        """Convert to the format expected by the OpenAI-compatible API.
+
+        Gemma 2 (MamayLM) does not support the 'system' role, so the system
+        prompt is prepended to the first user message instead.
+        """
+        result: list[dict[str, str]] = []
+        for m in self.messages:
+            if m.role == "system":
+                continue  # handled below
+            result.append({"role": m.role, "content": m.content})
+
+        # Prepend system prompt to first user message
+        if self.system_prompt and result:
+            for i, msg in enumerate(result):
+                if msg["role"] == "user":
+                    result[i] = {
+                        "role": "user",
+                        "content": f"{self.system_prompt}\n\n{msg['content']}",
+                    }
+                    break
+        return result
 
 
 class LLMClient:
