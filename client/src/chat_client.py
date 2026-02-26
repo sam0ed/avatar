@@ -68,7 +68,7 @@ class ChatClient:
     async def send_chat(self, text: str) -> None:
         """Send a chat message and process streaming response.
 
-        Displays LLM tokens in real-time and queues audio for playback.
+        Displays LLM tokens in real-time and plays audio as it arrives.
 
         Args:
             text: User message text.
@@ -89,7 +89,11 @@ class ChatClient:
         first_token_time: float | None = None
         first_audio_time: float | None = None
         token_count = 0
-        audio_chunks: list[tuple[str, bytes]] = []
+        audio_count = 0
+
+        # Start background audio player
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        player_task = asyncio.create_task(self._play_audio_queue(audio_queue)) if self.play_audio else None
 
         print("\n\033[1mAvatar:\033[0m ", end="", flush=True)
 
@@ -108,12 +112,13 @@ class ChatClient:
 
                 elif msg_type == "chat_audio":
                     audio_b64 = response.get("data", "")
-                    sentence = response.get("sentence", "")
                     if audio_b64:
                         audio_data = base64.b64decode(audio_b64)
-                        audio_chunks.append((sentence, audio_data))
+                        audio_count += 1
                         if first_audio_time is None:
                             first_audio_time = time.perf_counter()
+                        # Send to player immediately — don't wait
+                        await audio_queue.put(audio_data)
 
                 elif msg_type == "chat_done":
                     print()  # newline after streaming tokens
@@ -136,14 +141,27 @@ class ChatClient:
         if first_audio_time is not None:
             stats.append(f"First audio: {first_audio_time - start_time:.2f}s")
         stats.append(f"Tokens: {token_count}")
-        stats.append(f"Audio chunks: {len(audio_chunks)}")
+        stats.append(f"Audio chunks: {audio_count}")
         print(f"\033[90m[{' | '.join(stats)}]\033[0m")
 
-        # Play audio sequentially
-        if self.play_audio and audio_chunks:
-            print("\033[90m[Playing audio...]\033[0m", flush=True)
-            for sentence, audio_data in audio_chunks:
-                _play_wav(audio_data)
+        # Signal audio player to finish and wait for it
+        if player_task:
+            await audio_queue.put(None)  # sentinel
+            await player_task
+
+    async def _play_audio_queue(self, queue: asyncio.Queue[bytes | None]) -> None:
+        """Play audio chunks from queue as they arrive.
+
+        Runs as a background task. Stops when it receives None sentinel.
+
+        Args:
+            queue: Queue of WAV audio bytes (None = stop).
+        """
+        while True:
+            audio_data = await queue.get()
+            if audio_data is None:
+                break
+            await asyncio.get_event_loop().run_in_executor(None, _play_wav, audio_data)
 
     async def run(self) -> None:
         """Main interactive chat loop."""
