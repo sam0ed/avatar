@@ -48,5 +48,11 @@ docker/.env
 *.mp3
 *.mp4
 *.avi
+
+# Voice recordings (personal voice samples)
+recordings/
+
+# TTS/test output
+output/
 recordings/
 output/

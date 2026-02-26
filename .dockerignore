@@ -1,0 +1,16 @@
+# Docker context ignore for avatar builds (run from repo root)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.git/
+.gitignore
+models/
+output/
+recordings/
+client/
+scripts/
+docs/
+*.md
+.github/

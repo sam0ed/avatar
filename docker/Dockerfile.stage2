@@ -1,0 +1,44 @@
+# Avatar Stage 2 — LLM + TTS + Orchestrator
+# Base: Fish Speech server image (already has Python 3.11, uv, PyTorch, CUDA, Fish Speech)
+# Adds: supervisor, llama-cpp-python, orchestrator code
+#
+# Build from repo root (--provenance=false avoids OCI layer format that causes
+# full base-image re-upload on push — saves ~1GB+ on slow uplinks):
+#   docker build --provenance=false -f docker/Dockerfile.stage2 -t sam0ed/avatar-server:stage2 .
+#
+# On Vast.ai the entrypoint downloads models (~9GB) then starts supervisord.
+
+FROM fishaudio/fish-speech:server-cuda
+
+# Fish Speech image may use non-root user; switch to root for installs
+USER root
+
+# ---------- system deps ----------
+RUN apt-get update && apt-get install -y --no-install-recommends supervisor \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- LLM server (isolated venv with pre-built CUDA wheel) ----------
+RUN uv venv /opt/llm-venv && \
+    uv pip install --python /opt/llm-venv/bin/python --no-cache-dir \
+    'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1' \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu126
+
+# ---------- supervisord config ----------
+COPY docker/supervisord.conf /etc/supervisor/conf.d/avatar.conf
+
+# ---------- entrypoint (model download + supervisord start) ----------
+COPY docker/entrypoint_stage2.sh /app/entrypoint_stage2.sh
+RUN chmod +x /app/entrypoint_stage2.sh
+
+# ---------- orchestrator code ----------
+COPY server/pyproject.toml /app/orchestrator/pyproject.toml
+COPY server/src/ /app/orchestrator/src/
+
+# Install orchestrator deps (uv lock + sync)
+WORKDIR /app/orchestrator
+RUN uv lock --no-cache && uv sync --no-dev --no-cache
+
+WORKDIR /app
+
+# Ports: 8000 (WebSocket), 8001 (LLM API), 8080 (TTS API)
+EXPOSE 8000 8001 8080
