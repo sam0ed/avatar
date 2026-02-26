@@ -3,18 +3,18 @@
 # ///
 """Deploy Stage 2 (LLM + TTS + Orchestrator) to Vast.ai.
 
-Builds a Docker image with all code and deps baked in, pushes to
-Docker Hub, then creates a Vast.ai instance.  The onstart-cmd just
-runs the entrypoint (model download + supervisord start).
+Uses the off-the-shelf fishaudio/fish-speech:server-cuda image.
+The onstart-cmd git-clones the public repo, installs supervisor +
+llama-cpp-python, copies configs/code, then runs the entrypoint
+(model download + supervisord start).  No custom Docker image needed.
 
 Usage:
     HF_TOKEN=hf_xxx uv run scripts/deploy_stage2.py
     HF_TOKEN=hf_xxx uv run scripts/deploy_stage2.py --offer 12345678
-    uv run scripts/deploy_stage2.py --skip-build --offer 12345678
 
 Notes:
-    - First build pulls the ~5GB base image (cached afterwards).
-    - First boot downloads ~9GB of model weights (LLM + TTS).
+    - Repo must be public on GitHub (code is cloned at boot).
+    - First boot installs deps (~2 min) + downloads ~9GB of model weights.
     - HF_TOKEN required for gated TTS model (env var or .env file).
     - Ports: 8000 (WebSocket), 8001 (LLM API), 8080 (TTS API).
 """
@@ -27,8 +27,8 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DOCKER_IMAGE = "sam0ed/avatar-server:stage2"
-DOCKERFILE = "docker/Dockerfile.stage2"
+IMAGE = "fishaudio/fish-speech:server-cuda"
+GITHUB_REPO = "https://github.com/sam0ed/avatar.git"
 DISK = "80"
 BLOCKED_REGIONS = {"CN", "RU"}
 
@@ -46,32 +46,43 @@ def get_hf_token() -> str:
     return token
 
 
-def build_and_push() -> bool:
-    """Build Docker image and push to Docker Hub.
+def build_onstart_cmd() -> str:
+    """Build the onstart command that sets up the container at boot.
+
+    Steps:
+        1. Install supervisor + git via apt.
+        2. Create isolated venv for LLM server, install llama-cpp-python.
+        3. Git clone the public repo (shallow, saves time).
+        4. Copy configs (supervisord, entrypoint) and orchestrator code.
+        5. Install orchestrator Python deps via uv.
+        6. Run entrypoint (downloads models, starts supervisord).
 
     Returns:
-        True on success, False on failure.
+        Shell command string (~750 chars, well under Vast.ai 4048 limit).
     """
-    print(f"Building {DOCKER_IMAGE} ...")
-    result = subprocess.run(
-        [
-            "docker", "build",
-            "--provenance=false",
-            "-f", DOCKERFILE, "-t", DOCKER_IMAGE, ".",
-        ],
-        cwd=str(PROJECT_ROOT),
-    )
-    if result.returncode != 0:
-        print("ERROR: Docker build failed.", file=sys.stderr)
-        return False
-
-    print(f"\nPushing {DOCKER_IMAGE} ...")
-    result = subprocess.run(["docker", "push", DOCKER_IMAGE])
-    if result.returncode != 0:
-        print("ERROR: Docker push failed. Run 'docker login' first?", file=sys.stderr)
-        return False
-
-    return True
+    steps = [
+        # 1. System deps
+        "apt-get update -qq && apt-get install -y -qq supervisor git",
+        # 2. LLM venv + deps (pre-built CUDA wheel, no nvcc needed)
+        "uv venv /opt/llm-venv"
+        " && uv pip install --python /opt/llm-venv/bin/python"
+        " 'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1'"
+        " --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu126",
+        # 3. Clone repo
+        f"git clone --depth 1 {GITHUB_REPO} /tmp/av",
+        # 4. Copy configs + code
+        "cp /tmp/av/docker/supervisord.conf /etc/supervisor/conf.d/avatar.conf"
+        " && cp /tmp/av/docker/entrypoint_stage2.sh /app/"
+        " && chmod +x /app/entrypoint_stage2.sh"
+        " && mkdir -p /app/orchestrator"
+        " && cp -r /tmp/av/server/src /app/orchestrator/"
+        " && cp /tmp/av/server/pyproject.toml /app/orchestrator/",
+        # 5. Install orchestrator deps
+        "cd /app/orchestrator && uv lock && uv sync --no-dev",
+        # 6. Run entrypoint (model download + supervisord)
+        "cd /app && bash /app/entrypoint_stage2.sh",
+    ]
+    return " && ".join(steps)
 
 
 def search_offers() -> str | None:
@@ -117,10 +128,6 @@ def main() -> None:
     """Deploy Stage 2 to Vast.ai."""
     parser = argparse.ArgumentParser(description="Deploy Stage 2 to Vast.ai")
     parser.add_argument("--offer", help="Vast.ai offer ID (skips search)")
-    parser.add_argument(
-        "--skip-build", action="store_true",
-        help="Skip Docker build+push (use previously pushed image)",
-    )
     args = parser.parse_args()
 
     hf_token = get_hf_token()
@@ -128,39 +135,35 @@ def main() -> None:
         print("ERROR: Set HF_TOKEN env var or add HF_TOKEN=... to .env", file=sys.stderr)
         sys.exit(1)
 
-    # --- Build & push Docker image ---
-    if not args.skip_build:
-        if not build_and_push():
-            sys.exit(1)
-    else:
-        print(f"Skipping build, using {DOCKER_IMAGE}")
-
     # --- Find or use offer ---
     offer_id = args.offer or search_offers()
     if not offer_id:
         sys.exit(1)
 
     # --- Create instance ---
-    onstart_cmd = "bash /app/entrypoint_stage2.sh"
+    onstart_cmd = build_onstart_cmd()
     env_flags = f"-e HF_TOKEN={hf_token} -p 8000:8000 -p 8001:8001 -p 8080:8080"
+
+    print(f"\nOnstart command ({len(onstart_cmd)} chars, limit 4048):")
+    print(onstart_cmd)
 
     cmd = [
         "vastai", "create", "instance", offer_id,
-        "--image", DOCKER_IMAGE,
+        "--image", IMAGE,
         "--disk", DISK,
         "--direct",
         "--env", env_flags,
         "--onstart-cmd", onstart_cmd,
     ]
 
-    print(f"\nCreating instance with image {DOCKER_IMAGE}...")
+    print(f"\nCreating instance with image {IMAGE}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     print(result.stdout)
     if result.stderr:
         print(result.stderr, file=sys.stderr)
 
     if result.returncode == 0 and "success" in result.stdout.lower():
-        print("Instance created. Model download will take ~10-15 min on first boot.")
+        print("Instance created. Dep install (~2 min) + model download (~10-15 min).")
         print("\nAfter instance starts:")
         print("  vastai show instances")
         print("  vastai ssh-url <INSTANCE_ID>")
