@@ -6,7 +6,7 @@ set -e
 
 # --- Environment defaults (override via Vast.ai -e flags) ---
 export MODEL_REPO="${MODEL_REPO:-INSAIT-Institute/MamayLM-Gemma-2-9B-IT-v0.1-GGUF}"
-export MODEL_FILE="${MODEL_FILE:-MamayLM-Gemma-2-9B-IT-v0.1-Q4_K_M.gguf}"
+export MODEL_FILE="${MODEL_FILE:-MamayLM-Gemma-2-9B-IT-v0.1.Q4_K_M.gguf}"
 export MODEL_DIR="${MODEL_DIR:-/models}"
 export LLM_HOST="${LLM_HOST:-0.0.0.0}"
 export LLM_PORT="${LLM_PORT:-8001}"
