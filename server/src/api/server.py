@@ -8,7 +8,6 @@ import asyncio
 import base64
 import logging
 import time
-from collections.abc import AsyncIterator
 
 import msgpack
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -111,15 +110,19 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
 
 async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
-    """Handle a chat message: LLM streaming → sentence chunking → TTS.
+    """Handle a chat message: LLM streaming → sentence chunking → TTS streaming.
 
     Sends back three types of messages:
       - chat_token: {"type": "chat_token", "data": str, "server_ts": float}
         — individual LLM tokens for real-time display
       - chat_audio: {"type": "chat_audio", "data": str (base64), "sentence": str, "server_ts": float}
-        — synthesized audio for a complete sentence
+        — synthesized audio chunk (complete WAV) for playback
       - chat_done: {"type": "chat_done", "full_text": str, "server_ts": float}
         — signals end of response
+
+    Sentences are synthesized in order via a background consumer task.
+    Each sentence’s audio is streamed as multiple small WAV chunks for
+    lower first-audio latency.
 
     Args:
         ws: WebSocket connection.
@@ -143,10 +146,36 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     session = _sessions[client_id]
     session.add_user_message(user_text)
 
-    # Stream LLM → chunk into sentences → synthesize each sentence
+    # Stream LLM → chunk into sentences → stream-synthesize each sentence
     chunker = SentenceChunker()
     full_response: list[str] = []
-    tts_tasks: list[asyncio.Task] = []
+    sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    audio_chunk_count = 0
+
+    async def _tts_consumer() -> None:
+        """Sequentially process sentences from the queue with streaming TTS."""
+        nonlocal audio_chunk_count
+        while True:
+            sentence = await sentence_queue.get()
+            if sentence is None:  # Poison pill — all sentences submitted
+                break
+            try:
+                chunk_idx = 0
+                async for wav_chunk in tts_client.synthesize_streaming(sentence):
+                    await ws.send_bytes(msgpack.packb({
+                        "type": "chat_audio",
+                        "data": base64.b64encode(wav_chunk).decode("ascii"),
+                        "sentence": sentence if chunk_idx == 0 else "",
+                        "server_ts": time.time(),
+                    }))
+                    chunk_idx += 1
+                audio_chunk_count += chunk_idx
+                if chunk_idx == 0:
+                    logger.warning("TTS streaming produced no audio: '%s'", sentence[:50])
+            except Exception:
+                logger.exception("TTS streaming error for: '%s'", sentence[:50])
+
+    consumer_task = asyncio.create_task(_tts_consumer())
 
     try:
         async for token in llm_client.stream_chat(session):
@@ -162,22 +191,16 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
             # Check for complete sentences
             sentences = chunker.add(token)
             for sentence in sentences:
-                task = asyncio.create_task(
-                    _synthesize_and_send(ws, sentence)
-                )
-                tts_tasks.append(task)
+                await sentence_queue.put(sentence)
 
         # Flush remaining text from chunker
         remainder = chunker.flush()
         if remainder:
-            task = asyncio.create_task(
-                _synthesize_and_send(ws, remainder)
-            )
-            tts_tasks.append(task)
+            await sentence_queue.put(remainder)
 
-        # Wait for all TTS tasks to complete
-        if tts_tasks:
-            await asyncio.gather(*tts_tasks)
+        # Signal TTS consumer to stop after processing all sentences
+        await sentence_queue.put(None)
+        await consumer_task
 
         # Store assistant response in session history
         assistant_text = "".join(full_response)
@@ -190,31 +213,13 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
             "server_ts": time.time(),
         }))
 
-        logger.info("Chat response to %s: %d chars, %d audio chunks", client_id, len(assistant_text), len(tts_tasks))
+        logger.info("Chat response to %s: %d chars, %d audio chunks", client_id, len(assistant_text), audio_chunk_count)
 
     except Exception:
         logger.exception("Chat pipeline error for %s", client_id)
+        consumer_task.cancel()
         await ws.send_bytes(msgpack.packb({
             "type": "error",
             "message": "Chat pipeline error",
             "server_ts": time.time(),
         }))
-
-
-async def _synthesize_and_send(ws: WebSocket, sentence: str) -> None:
-    """Synthesize a sentence and send the audio to the client.
-
-    Args:
-        ws: WebSocket connection.
-        sentence: Text to synthesize.
-    """
-    audio_data = await tts_client.synthesize(sentence)
-    if audio_data:
-        await ws.send_bytes(msgpack.packb({
-            "type": "chat_audio",
-            "data": base64.b64encode(audio_data).decode("ascii"),
-            "sentence": sentence,
-            "server_ts": time.time(),
-        }))
-    else:
-        logger.warning("TTS synthesis failed for: '%s'", sentence[:50])

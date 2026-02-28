@@ -6,6 +6,8 @@ Mirrors the protocol from client/src/tts_test.py but async.
 
 import logging
 import os
+import struct
+from collections.abc import AsyncIterator
 
 import httpx
 import ormsgpack
@@ -14,6 +16,44 @@ logger = logging.getLogger("avatar.tts.client")
 
 # TTS service URL — set by Docker Compose env or fallback
 TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8080")
+
+
+def _make_wav_header(
+    data_size: int,
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+) -> bytes:
+    """Create a minimal WAV header for PCM audio.
+
+    Args:
+        data_size: Size of the PCM data in bytes.
+        sample_rate: Audio sample rate in Hz.
+        channels: Number of audio channels.
+        sample_width: Bytes per sample (e.g. 2 for 16-bit).
+
+    Returns:
+        44-byte WAV header.
+    """
+    byte_rate = sample_rate * channels * sample_width
+    block_align = channels * sample_width
+    bits_per_sample = sample_width * 8
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM format
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
 
 
 class TTSClient:
@@ -110,6 +150,139 @@ class TTSClient:
         except Exception as e:
             logger.error("TTS request failed: %s", e)
             return None
+
+    async def synthesize_streaming(self, text: str) -> AsyncIterator[bytes]:
+        """Synthesize text to audio with streaming.
+
+        Yields complete WAV audio chunks as they become available from
+        the TTS server. Each chunk is a self-contained WAV file that
+        can be played independently.
+
+        Args:
+            text: Text to synthesize.
+
+        Yields:
+            WAV audio bytes (each chunk is a complete, playable WAV file).
+        """
+        payload: dict = {
+            "text": text,
+            "format": "wav",  # streaming only supports wav
+            "streaming": True,
+            "normalize": True,
+            "max_new_tokens": 1024,
+            "top_p": 0.8,
+            "temperature": 0.8,
+            "repetition_penalty": 1.1,
+            "chunk_length": 200,
+        }
+
+        if self.reference_id:
+            payload["reference_id"] = self.reference_id
+
+        body = ormsgpack.packb(payload)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/v1/tts",
+                    content=body,
+                    headers={"Content-Type": "application/msgpack"},
+                    timeout=self.timeout,
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        logger.error(
+                            "TTS streaming failed (%d): %s",
+                            resp.status_code,
+                            error_body[:500],
+                        )
+                        return
+
+                    # Parse WAV header from the stream, then yield PCM
+                    # chunks wrapped in their own WAV headers.
+                    accumulated = b""
+                    header_parsed = False
+                    sample_rate = 44100
+                    channels = 1
+                    sample_width = 2
+                    pcm_buffer = b""
+                    min_chunk_bytes = 0
+                    total_pcm = 0
+
+                    async for raw_chunk in resp.aiter_bytes():
+                        if not header_parsed:
+                            accumulated += raw_chunk
+                            # Look for "data" sub-chunk marker
+                            data_idx = accumulated.find(b"data")
+                            if data_idx >= 0 and len(accumulated) >= data_idx + 8:
+                                # Parse format info from fmt chunk
+                                if len(accumulated) >= 36:
+                                    channels = struct.unpack_from(
+                                        "<H", accumulated, 22
+                                    )[0]
+                                    sample_rate = struct.unpack_from(
+                                        "<I", accumulated, 24
+                                    )[0]
+                                    sample_width = (
+                                        struct.unpack_from("<H", accumulated, 34)[0]
+                                        // 8
+                                    )
+                                header_size = data_idx + 8
+                                # ~0.2s of audio as minimum yield threshold
+                                min_chunk_bytes = max(
+                                    sample_rate * channels * sample_width // 5,
+                                    3200,
+                                )
+                                pcm_buffer = accumulated[header_size:]
+                                header_parsed = True
+                                accumulated = b""
+                                logger.debug(
+                                    "TTS stream header: %d Hz, %d ch, %d-bit",
+                                    sample_rate,
+                                    channels,
+                                    sample_width * 8,
+                                )
+                        else:
+                            pcm_buffer += raw_chunk
+
+                        # Yield when we have enough PCM data
+                        if header_parsed and len(pcm_buffer) >= min_chunk_bytes:
+                            wav_data = (
+                                _make_wav_header(
+                                    len(pcm_buffer),
+                                    sample_rate,
+                                    channels,
+                                    sample_width,
+                                )
+                                + pcm_buffer
+                            )
+                            total_pcm += len(pcm_buffer)
+                            yield wav_data
+                            pcm_buffer = b""
+
+                    # Flush remaining PCM data
+                    if pcm_buffer:
+                        wav_data = (
+                            _make_wav_header(
+                                len(pcm_buffer),
+                                sample_rate,
+                                channels,
+                                sample_width,
+                            )
+                            + pcm_buffer
+                        )
+                        total_pcm += len(pcm_buffer)
+                        yield wav_data
+
+                    logger.info(
+                        "TTS streamed %d bytes for '%s' (%d chars)",
+                        total_pcm,
+                        text[:50],
+                        len(text),
+                    )
+        except Exception as e:
+            logger.error("TTS streaming request failed: %s", e)
 
     async def upload_reference(
         self,
