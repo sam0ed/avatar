@@ -14,8 +14,9 @@ Usage:
 
 Notes:
     - Repo must be public on GitHub (code is cloned at boot).
-    - First boot installs deps (~2 min) + downloads ~9GB of model weights.
+    - First boot installs deps (~3 min) + downloads ~9GB of model weights.
     - HF_TOKEN required for gated TTS model (env var or .env file).
+    - Python 3.11 installed via deadsnakes PPA (CUDA wheels only exist for cp310/cp311).
     - Ports: 8000 (WebSocket), 8001 (LLM API), 8080 (TTS API).
 """
 
@@ -63,13 +64,17 @@ def build_onstart_cmd() -> str:
     steps = [
         # 0. Fix SSH permissions (Vast.ai creates authorized_keys with wrong modes)
         "chmod 700 /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; true",
-        # 1. System deps
-        "apt-get update -qq && apt-get install -y -qq supervisor git",
-        # 2. LLM venv + deps (pre-built CUDA wheel, no nvcc needed)
-        "uv venv /opt/llm-venv"
-        " && uv pip install --python /opt/llm-venv/bin/python"
+        # 1. System deps + Python 3.11 (CUDA wheels only exist for cp310/cp311)
+        "apt-get update -qq"
+        " && apt-get install -y -qq supervisor git software-properties-common"
+        " && add-apt-repository -y ppa:deadsnakes/ppa"
+        " && apt-get install -y -qq python3.11 python3.11-venv",
+        # 2. LLM venv + deps (pre-built CUDA 12.4 wheel for Python 3.11)
+        "python3.11 -m venv /opt/llm-venv"
+        " && /opt/llm-venv/bin/pip install"
         " 'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1'"
-        " --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu126",
+        " --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"
+        " --extra-index-url https://pypi.org/simple",
         # 3. Clone repo
         f"git clone --depth 1 {GITHUB_REPO} /tmp/av",
         # 4. Copy configs + code
@@ -165,7 +170,7 @@ def main() -> None:
         print(result.stderr, file=sys.stderr)
 
     if result.returncode == 0 and "success" in result.stdout.lower():
-        print("Instance created. Dep install (~2 min) + model download (~10-15 min).")
+        print("Instance created. Dep install (~3 min) + model download (~10-15 min).")
         print("\nAfter instance starts:")
         print("  vastai show instances")
         print("  vastai ssh-url <INSTANCE_ID>")
