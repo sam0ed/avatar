@@ -61,13 +61,13 @@ class TTSClient:
     """Async client for Fish Speech TTS API.
 
     Sends text to the TTS service and receives synthesized WAV audio.
-    Supports voice cloning via pre-uploaded reference IDs.
+    Supports voice cloning via inline reference audio (all samples sent
+    with every request, so Fish Speech uses them as in-context examples).
     """
 
     def __init__(
         self,
         base_url: str = TTS_BASE_URL,
-        reference_id: str | None = None,
         output_format: str = "wav",
         timeout: float = 60.0,
     ) -> None:
@@ -75,14 +75,66 @@ class TTSClient:
 
         Args:
             base_url: Fish Speech API base URL.
-            reference_id: Pre-uploaded voice reference ID for cloning.
             output_format: Audio output format (wav, mp3, pcm).
             timeout: Request timeout in seconds.
         """
         self.base_url = base_url.rstrip("/")
-        self.reference_id = reference_id
         self.output_format = output_format
         self.timeout = timeout
+        # Inline voice references: list of {"audio": bytes, "text": str}
+        self._references: list[dict[str, bytes | str]] = []
+        self._voice_enabled: bool = False
+
+    @property
+    def voice_enabled(self) -> bool:
+        """Whether voice cloning is currently active."""
+        return self._voice_enabled
+
+    @property
+    def reference_count(self) -> int:
+        """Number of loaded voice reference samples."""
+        return len(self._references)
+
+    def add_reference(self, audio: bytes, text: str) -> int:
+        """Add a voice reference sample (audio + transcript).
+
+        Args:
+            audio: WAV audio bytes.
+            text: Transcript of the audio.
+
+        Returns:
+            Total number of references after adding.
+        """
+        self._references.append({"audio": audio, "text": text})
+        logger.info(
+            "Added voice reference (%d bytes, %d chars) — total %d",
+            len(audio), len(text), len(self._references),
+        )
+        return len(self._references)
+
+    def clear_references(self) -> None:
+        """Remove all voice references and disable cloning."""
+        self._references.clear()
+        self._voice_enabled = False
+        logger.info("Cleared all voice references, cloning disabled")
+
+    def enable_voice(self) -> bool:
+        """Enable voice cloning (requires at least one reference).
+
+        Returns:
+            True if enabled, False if no references loaded.
+        """
+        if not self._references:
+            logger.warning("Cannot enable voice cloning: no references loaded")
+            return False
+        self._voice_enabled = True
+        logger.info("Voice cloning enabled with %d references", len(self._references))
+        return True
+
+    def disable_voice(self) -> None:
+        """Disable voice cloning (keeps references for re-enabling)."""
+        self._voice_enabled = False
+        logger.info("Voice cloning disabled (references retained)")
 
     async def health_check(self) -> bool:
         """Check if the TTS server is healthy.
@@ -123,8 +175,8 @@ class TTSClient:
             "chunk_length": 200,
         }
 
-        if self.reference_id:
-            payload["reference_id"] = self.reference_id
+        if self._voice_enabled and self._references:
+            payload["references"] = self._references
 
         body = ormsgpack.packb(payload)
 
@@ -177,8 +229,8 @@ class TTSClient:
             "chunk_length": 200,
         }
 
-        if self.reference_id:
-            payload["reference_id"] = self.reference_id
+        if self._voice_enabled and self._references:
+            payload["references"] = self._references
 
         body = ormsgpack.packb(payload)
 
@@ -269,63 +321,46 @@ class TTSClient:
         except Exception as e:
             logger.error("TTS streaming request failed: %s", e)
 
-    async def upload_reference(
-        self,
-        reference_id: str,
-        audio_bytes: bytes,
-        audio_filename: str,
-        transcript: str,
-    ) -> bool:
-        """Upload a voice reference to the TTS server.
+    async def warmup(self) -> bool:
+        """Send a warmup synthesis request to trigger torch.compile tracing.
 
-        Args:
-            reference_id: Unique ID for this voice reference.
-            audio_bytes: WAV audio file bytes.
-            audio_filename: Original filename of the audio.
-            transcript: Text transcript of what was said in the audio.
+        If voice references are loaded, sends a request WITH references
+        so torch.compile traces the voice-cloning code path.
 
         Returns:
-            True if upload succeeded.
+            True if warmup succeeded.
         """
+        payload: dict = {
+            "text": "Hello world warmup test.",
+            "format": "wav",
+            "streaming": False,
+            "normalize": True,
+            "max_new_tokens": 1024,
+        }
+        if self._voice_enabled and self._references:
+            payload["references"] = self._references
+
+        body = ormsgpack.packb(payload)
+
         try:
+            t_start = time.monotonic()
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    f"{self.base_url}/v1/references/add",
-                    files={"audio": (audio_filename, audio_bytes, "audio/wav")},
-                    data={"id": reference_id, "text": transcript},
-                    timeout=30.0,
+                    f"{self.base_url}/v1/tts",
+                    content=body,
+                    headers={"Content-Type": "application/msgpack"},
+                    timeout=120.0,
                 )
-                if resp.status_code == 200:
-                    data = ormsgpack.unpackb(resp.content)
-                    logger.info("Reference '%s' uploaded: %s", reference_id, data.get("message"))
-                    return True
-                else:
-                    logger.error(
-                        "Reference upload failed (%d): %s",
-                        resp.status_code,
-                        resp.content[:500],
-                    )
-                    return False
+            elapsed = time.monotonic() - t_start
+            if resp.status_code == 200:
+                logger.info(
+                    "TTS warmup OK: %d bytes in %.1fs (voice_cloning=%s)",
+                    len(resp.content), elapsed, self._voice_enabled,
+                )
+                return True
+            else:
+                logger.warning("TTS warmup failed (%d): %s", resp.status_code, resp.text[:200])
+                return False
         except Exception as e:
-            logger.error("Reference upload failed: %s", e)
+            logger.error("TTS warmup error: %s", e)
             return False
-
-    async def list_references(self) -> list[str]:
-        """List available voice references on the server.
-
-        Returns:
-            List of reference IDs.
-        """
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.base_url}/v1/references/list",
-                    timeout=10.0,
-                )
-                data = ormsgpack.unpackb(resp.content)
-                ref_ids = data.get("reference_ids", [])
-                logger.info("Available TTS references: %s", ref_ids)
-                return ref_ids
-        except Exception as e:
-            logger.error("List references failed: %s", e)
-            return []

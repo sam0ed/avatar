@@ -10,7 +10,7 @@ import logging
 import time
 
 import msgpack
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 
 from src.llm.chunker import SentenceChunker
 from src.llm.client import ChatSession, LLMClient
@@ -22,11 +22,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-app = FastAPI(title="Avatar Server", version="0.2.0")
+app = FastAPI(title="Avatar Server", version="0.3.0")
 
 # Service clients — initialized once, reused across requests
 llm_client = LLMClient()
 tts_client = TTSClient()
+logger.info("Voice cloning disabled by default (upload references + enable via /voice endpoints)")
 
 # Per-connection chat sessions (keyed by client id)
 _sessions: dict[str, ChatSession] = {}
@@ -46,9 +47,65 @@ async def health() -> dict[str, str]:
     tts_ok = await tts_client.health_check()
     return {
         "status": "ok" if (llm_ok and tts_ok) else "degraded",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "llm": "ok" if llm_ok else "unavailable",
         "tts": "ok" if tts_ok else "unavailable",
+    }
+
+
+# ── Voice cloning endpoints ──────────────────────────────────────────
+
+
+@app.post("/voice/reference")
+async def upload_voice_reference(
+    audio: UploadFile = File(..., description="WAV audio file"),
+    text: str = Form(..., description="Transcript of the audio"),
+) -> dict:
+    """Upload a voice reference sample for cloning.
+
+    Accepts a WAV file and its transcript. Multiple references can be
+    uploaded — all are sent as in-context examples to the TTS model.
+    """
+    audio_bytes = await audio.read()
+    count = tts_client.add_reference(audio_bytes, text)
+    return {
+        "message": f"Reference added ({len(audio_bytes)} bytes)",
+        "reference_count": count,
+    }
+
+
+@app.post("/voice/enable")
+async def enable_voice() -> dict:
+    """Enable voice cloning and run TTS warmup with references.
+
+    Requires at least one reference to be uploaded first.
+    Warmup triggers torch.compile tracing with the voice-cloning code path.
+    """
+    ok = tts_client.enable_voice()
+    if not ok:
+        return {"enabled": False, "error": "No references uploaded"}
+
+    warmup_ok = await tts_client.warmup()
+    return {
+        "enabled": True,
+        "reference_count": tts_client.reference_count,
+        "warmup": "ok" if warmup_ok else "failed",
+    }
+
+
+@app.post("/voice/disable")
+async def disable_voice() -> dict:
+    """Disable voice cloning (uses default TTS voice)."""
+    tts_client.disable_voice()
+    return {"enabled": False, "reference_count": tts_client.reference_count}
+
+
+@app.get("/voice/status")
+async def voice_status() -> dict:
+    """Get current voice cloning status."""
+    return {
+        "enabled": tts_client.voice_enabled,
+        "reference_count": tts_client.reference_count,
     }
 
 
