@@ -199,67 +199,38 @@ class TTSClient:
                         )
                         return
 
-                    # Parse WAV header from the stream, then yield PCM
-                    # chunks wrapped in their own WAV headers.
-                    accumulated = b""
-                    header_parsed = False
+                    # Fish Speech streaming returns raw PCM (no WAV
+                    # header).  We know the format from the non-streaming
+                    # endpoint: 44100 Hz, mono, 16-bit signed LE.
                     sample_rate = 44100
                     channels = 1
-                    sample_width = 2
+                    sample_width = 2  # bytes per sample
+                    # ~0.2s of audio as minimum yield threshold
+                    min_chunk_bytes = max(
+                        sample_rate * channels * sample_width // 5,
+                        3200,
+                    )
                     pcm_buffer = b""
-                    min_chunk_bytes = 0
                     total_pcm = 0
 
                     async for raw_chunk in resp.aiter_bytes():
-                        if not header_parsed:
-                            accumulated += raw_chunk
-                            # Look for "data" sub-chunk marker
-                            data_idx = accumulated.find(b"data")
-                            if data_idx >= 0 and len(accumulated) >= data_idx + 8:
-                                # Parse format info from fmt chunk
-                                if len(accumulated) >= 36:
-                                    channels = struct.unpack_from(
-                                        "<H", accumulated, 22
-                                    )[0]
-                                    sample_rate = struct.unpack_from(
-                                        "<I", accumulated, 24
-                                    )[0]
-                                    sample_width = (
-                                        struct.unpack_from("<H", accumulated, 34)[0]
-                                        // 8
-                                    )
-                                header_size = data_idx + 8
-                                # ~0.2s of audio as minimum yield threshold
-                                min_chunk_bytes = max(
-                                    sample_rate * channels * sample_width // 5,
-                                    3200,
-                                )
-                                pcm_buffer = accumulated[header_size:]
-                                header_parsed = True
-                                accumulated = b""
-                                logger.debug(
-                                    "TTS stream header: %d Hz, %d ch, %d-bit",
-                                    sample_rate,
-                                    channels,
-                                    sample_width * 8,
-                                )
-                        else:
-                            pcm_buffer += raw_chunk
+                        pcm_buffer += raw_chunk
 
                         # Yield when we have enough PCM data
-                        if header_parsed and len(pcm_buffer) >= min_chunk_bytes:
+                        while len(pcm_buffer) >= min_chunk_bytes:
+                            chunk = pcm_buffer[:min_chunk_bytes]
+                            pcm_buffer = pcm_buffer[min_chunk_bytes:]
                             wav_data = (
                                 _make_wav_header(
-                                    len(pcm_buffer),
+                                    len(chunk),
                                     sample_rate,
                                     channels,
                                     sample_width,
                                 )
-                                + pcm_buffer
+                                + chunk
                             )
-                            total_pcm += len(pcm_buffer)
+                            total_pcm += len(chunk)
                             yield wav_data
-                            pcm_buffer = b""
 
                     # Flush remaining PCM data
                     if pcm_buffer:
