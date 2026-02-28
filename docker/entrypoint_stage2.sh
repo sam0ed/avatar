@@ -70,4 +70,28 @@ mkdir -p /app/references /var/log/supervisor
 # --- 4. Start all services via supervisord ---
 echo ""
 echo "Starting services via supervisord ..."
-exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf
+/usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+
+# --- 5. Warmup TTS (torch.compile first-request penalty ~30-60s) ---
+echo ""
+echo "Waiting for TTS server to be ready ..."
+for i in $(seq 1 60); do
+    if curl -sf http://localhost:8080/v1/health > /dev/null 2>&1; then
+        echo "TTS health OK after ${i}s"
+        break
+    fi
+    sleep 1
+done
+
+echo "Sending TTS warmup request (torch.compile will trace on first call) ..."
+WARMUP_START=$(date +%s)
+curl -sf -X POST http://localhost:8080/v1/tts \
+    -H 'Content-Type: application/json' \
+    -d '{"text": "Hello world.", "streaming": false}' \
+    -o /dev/null || echo "Warmup request failed (non-fatal)"
+WARMUP_END=$(date +%s)
+echo "TTS warmup completed in $((WARMUP_END - WARMUP_START))s"
+
+# Keep container running — attach to supervisord
+echo "All services ready. Entering supervisord loop."
+exec tail -f /var/log/supervisor/*.log
