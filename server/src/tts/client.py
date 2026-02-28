@@ -7,6 +7,7 @@ Mirrors the protocol from client/src/tts_test.py but async.
 import logging
 import os
 import struct
+import time
 from collections.abc import AsyncIterator
 
 import httpx
@@ -182,6 +183,7 @@ class TTSClient:
         body = ormsgpack.packb(payload)
 
         try:
+            t_start = time.monotonic()
             async with httpx.AsyncClient() as client:
                 async with client.stream(
                     "POST",
@@ -212,8 +214,12 @@ class TTSClient:
                     )
                     pcm_buffer = b""
                     total_pcm = 0
+                    t_first_byte: float | None = None
+                    chunk_count = 0
 
                     async for raw_chunk in resp.aiter_bytes():
+                        if t_first_byte is None:
+                            t_first_byte = time.monotonic()
                         pcm_buffer += raw_chunk
 
                         # Yield when we have enough PCM data
@@ -230,6 +236,7 @@ class TTSClient:
                                 + chunk
                             )
                             total_pcm += len(chunk)
+                            chunk_count += 1
                             yield wav_data
 
                     # Flush remaining PCM data
@@ -244,13 +251,20 @@ class TTSClient:
                             + pcm_buffer
                         )
                         total_pcm += len(pcm_buffer)
+                        chunk_count += 1
                         yield wav_data
 
+                    t_end = time.monotonic()
+                    t_fb = (t_first_byte - t_start) if t_first_byte else -1
                     logger.info(
-                        "TTS streamed %d bytes for '%s' (%d chars)",
+                        "TTS streamed %d bytes (%d chunks) for '%s' (%d chars) "
+                        "— first byte %.2fs, total %.2fs",
                         total_pcm,
+                        chunk_count,
                         text[:50],
                         len(text),
+                        t_fb,
+                        t_end - t_start,
                     )
         except Exception as e:
             logger.error("TTS streaming request failed: %s", e)

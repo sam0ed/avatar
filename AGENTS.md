@@ -152,6 +152,24 @@ Next: Deploy to Vast.ai using `deploy_stage2.py`, verify end-to-end (type text �
 - **HF_TOKEN required**: The `fishaudio/openaudio-s1-mini` model is gated. Must accept license at https://huggingface.co/fishaudio/openaudio-s1-mini and provide token via `HF_TOKEN` env var or `.env` file.
 - **Vast.ai SSH**: Use `vastai create ssh-key` (not `set ssh-key`). Key propagation to running instances may take a moment.
 
+## Vast.ai Instance Log
+
+Track which machines/offers work, which have direct ports, SSH, etc.
+
+| Date | Offer ID | Instance ID | Location | $/hr | Direct Ports | SSH | Status | Notes |
+|------|----------|-------------|----------|------|-------------|-----|--------|-------|
+| 2026-02-15 | ? | ? | Denmark, DK | ~$0.27 | Yes | ? | OK | Stage 0 echo test. 48ms RTT. |
+| 2026-02-15 | ? | 31466745 | Netherlands, NL | $0.30 | Yes | ? | OK | Stage 1 TTS. IP 38.117.87.41, port 8080→46682. |
+| 2026-02-28 | ? | 32170567 | South Africa | ~$0.24 | ? | ? | BAD | Destroyed quickly — not found when checked. |
+| 2026-02-28 | ? | 32170653 | Hong Kong, HK | $0.276 | Yes (1024-9549) | No (DNS failure) | BAD | Caddy 401 on all ports. `vastai logs` also failed (DNS). Instance had no outbound internet — onstart-cmd likely never completed. mach_id=53826, host_id=134693. **AVOID host 134693 / machine 53826.** |
+| 2026-02-28 | 30834393 | 32171485 | Nevada, US | $0.268 | No (`direct_port_start=-1`) | Yes | OK | SSH tunnel works. All 3 services healthy. mach_id=54431, host_id=74292. Access via `ssh -p 11484 root@ssh8.vast.ai` + port forwarding. |
+
+**Takeaways:**
+- Not all machines support direct port mapping (`direct_port_start=-1`). Use SSH tunnel (`-L 8000:localhost:8000`) as fallback.
+- Some datacenters (Hong Kong host 134693) have broken networking. Avoid them.
+- SSH works on some instances (Nevada) but not others. Try SSH first; if it fails, need direct ports.
+- Prefer machines where previous deploys succeeded (host_id 74292 = Nevada, known good).
+
 ## Known Risks
 
 - Face animation quality: MuseTalk is the only real-time option; quality is acceptable at Zoom compression but has artifacts
@@ -160,11 +178,14 @@ Next: Deploy to Vast.ai using `deploy_stage2.py`, verify end-to-end (type text �
 - Audio/video sync requires timestamp-based jitter buffering
 - Fish Speech first-request latency: ~8-10s for short text (includes model warmup); subsequent requests faster
 - Gated model access: HF token must be kept in `.env` (gitignored), never committed
+- **Vast.ai networking is inconsistent**: Some machines have no direct ports (need SSH tunnel), some have broken outbound DNS/internet, some have Caddy auth proxies. Always verify health endpoints after deploy. See "Vast.ai Instance Log" above.
 
 ## Notes for Agent
 
 - Always check this file at the start of a session to understand project state
 - Update the Progress Log after completing any stage or significant milestone
 - Update Current Stage when transitioning between stages
+- **Use `uv` for ALL Python operations** — never use pip, conda, or poetry. Run scripts with `uv run`, manage deps with `uv add`. Both `server/` and `client/` have their own `pyproject.toml`. The Vast.ai CLI is installed via `uv tool install vastai`.
 - When writing Python code: use type hints, async/await for I/O, and uv for dependencies
+- **Vast.ai access varies by machine** — some have direct ports, some need SSH tunnels, some have broken networking entirely. Always try SSH first (`ssh -p <port> root@<ssh_host>`), then fall back to direct ports. Check the "Vast.ai Instance Log" section for known-good and known-bad hosts.
 - The plan file at `.github/prompts/plan-digitalAvatarClone.prompt.md` has the detailed stage-by-stage breakdown

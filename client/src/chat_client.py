@@ -17,7 +17,6 @@ import time
 import wave
 
 import msgpack
-import numpy as np
 import sounddevice as sd
 import websockets
 from websockets.asyncio.client import ClientConnection
@@ -150,18 +149,46 @@ class ChatClient:
             await player_task
 
     async def _play_audio_queue(self, queue: asyncio.Queue[bytes | None]) -> None:
-        """Play audio chunks from queue as they arrive.
+        """Play audio chunks continuously without gaps.
 
-        Runs as a background task. Stops when it receives None sentinel.
+        Uses a single ``sd.RawOutputStream`` across all chunks so that
+        back-to-back writes produce seamless audio.  Each chunk is a
+        self-contained WAV; we strip the header and feed raw PCM into
+        the stream.
 
         Args:
             queue: Queue of WAV audio bytes (None = stop).
         """
-        while True:
-            audio_data = await queue.get()
-            if audio_data is None:
-                break
-            await asyncio.get_event_loop().run_in_executor(None, _play_wav, audio_data)
+        stream: sd.RawOutputStream | None = None
+        loop = asyncio.get_event_loop()
+
+        try:
+            while True:
+                audio_data = await queue.get()
+                if audio_data is None:
+                    break
+
+                try:
+                    with wave.open(io.BytesIO(audio_data), "rb") as wf:
+                        if stream is None:
+                            stream = sd.RawOutputStream(
+                                samplerate=wf.getframerate(),
+                                channels=wf.getnchannels(),
+                                dtype="int16",
+                            )
+                            stream.start()
+                        pcm = wf.readframes(wf.getnframes())
+
+                    # write() blocks until the device buffer has room —
+                    # run in executor to avoid blocking the event loop.
+                    await loop.run_in_executor(None, stream.write, pcm)
+                except Exception as e:
+                    logger.warning("Audio playback failed: %s", e)
+        finally:
+            if stream is not None:
+                # Drain the remaining audio in the device buffer
+                await loop.run_in_executor(None, stream.stop)
+                stream.close()
 
     async def run(self) -> None:
         """Main interactive chat loop."""
@@ -194,36 +221,6 @@ class ChatClient:
             if self._ws:
                 await self._ws.close()
             print("\033[90m[Disconnected]\033[0m")
-
-
-def _play_wav(audio_data: bytes) -> None:
-    """Play WAV audio bytes through speakers.
-
-    Args:
-        audio_data: WAV file bytes.
-    """
-    try:
-        with wave.open(io.BytesIO(audio_data), "rb") as wf:
-            sample_rate = wf.getframerate()
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            frames = wf.readframes(wf.getnframes())
-
-            if sample_width == 2:
-                dtype = np.int16
-            elif sample_width == 4:
-                dtype = np.int32
-            else:
-                dtype = np.float32
-
-            audio_array = np.frombuffer(frames, dtype=dtype)
-            if channels > 1:
-                audio_array = audio_array.reshape(-1, channels)
-
-            sd.play(audio_array, samplerate=sample_rate)
-            sd.wait()
-    except Exception as e:
-        logger.warning("Audio playback failed: %s", e)
 
 
 def main() -> None:

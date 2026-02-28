@@ -92,7 +92,7 @@ def search_offers() -> str | None:
     result = subprocess.run(
         [
             "vastai", "search", "offers",
-            "gpu_name=RTX_4090 num_gpus=1 reliability>0.95 disk_space>=80",
+            "gpu_name=RTX_4090 num_gpus=1 reliability>0.95 disk_space>=80 inet_down>=700",
             "-o", "dph+", "--limit", "20", "--raw",
         ],
         capture_output=True,
