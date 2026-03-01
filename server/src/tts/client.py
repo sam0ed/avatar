@@ -61,8 +61,9 @@ class TTSClient:
     """Async client for Fish Speech TTS API.
 
     Sends text to the TTS service and receives synthesized WAV audio.
-    Supports voice cloning via inline reference audio (all samples sent
-    with every request, so Fish Speech uses them as in-context examples).
+    Supports voice cloning via server-side references: upload audio to
+    Fish Speech (/v1/references/add), then set a reference_id.  The
+    server encodes once and caches (use_memory_cache="on").
     """
 
     def __init__(
@@ -81,60 +82,31 @@ class TTSClient:
         self.base_url = base_url.rstrip("/")
         self.output_format = output_format
         self.timeout = timeout
-        # Inline voice references: list of {"audio": bytes, "text": str}
-        self._references: list[dict[str, bytes | str]] = []
-        self._voice_enabled: bool = False
+        self._reference_id: str | None = None
 
     @property
     def voice_enabled(self) -> bool:
         """Whether voice cloning is currently active."""
-        return self._voice_enabled
+        return self._reference_id is not None
 
     @property
-    def reference_count(self) -> int:
-        """Number of loaded voice reference samples."""
-        return len(self._references)
+    def reference_id(self) -> str | None:
+        """Active reference ID for voice cloning."""
+        return self._reference_id
 
-    def add_reference(self, audio: bytes, text: str) -> int:
-        """Add a voice reference sample (audio + transcript).
+    def set_reference_id(self, ref_id: str) -> None:
+        """Enable voice cloning with the given reference ID.
 
         Args:
-            audio: WAV audio bytes.
-            text: Transcript of the audio.
-
-        Returns:
-            Total number of references after adding.
+            ref_id: Reference ID (must exist on the TTS server).
         """
-        self._references.append({"audio": audio, "text": text})
-        logger.info(
-            "Added voice reference (%d bytes, %d chars) — total %d",
-            len(audio), len(text), len(self._references),
-        )
-        return len(self._references)
+        self._reference_id = ref_id
+        logger.info("Voice cloning enabled with reference_id='%s'", ref_id)
 
-    def clear_references(self) -> None:
-        """Remove all voice references and disable cloning."""
-        self._references.clear()
-        self._voice_enabled = False
-        logger.info("Cleared all voice references, cloning disabled")
-
-    def enable_voice(self) -> bool:
-        """Enable voice cloning (requires at least one reference).
-
-        Returns:
-            True if enabled, False if no references loaded.
-        """
-        if not self._references:
-            logger.warning("Cannot enable voice cloning: no references loaded")
-            return False
-        self._voice_enabled = True
-        logger.info("Voice cloning enabled with %d references", len(self._references))
-        return True
-
-    def disable_voice(self) -> None:
-        """Disable voice cloning (keeps references for re-enabling)."""
-        self._voice_enabled = False
-        logger.info("Voice cloning disabled (references retained)")
+    def clear_reference_id(self) -> None:
+        """Disable voice cloning by clearing the reference ID."""
+        self._reference_id = None
+        logger.info("Voice cloning disabled (reference_id cleared)")
 
     async def health_check(self) -> bool:
         """Check if the TTS server is healthy.
@@ -175,8 +147,9 @@ class TTSClient:
             "chunk_length": 200,
         }
 
-        if self._voice_enabled and self._references:
-            payload["references"] = self._references
+        if self._reference_id:
+            payload["reference_id"] = self._reference_id
+            payload["use_memory_cache"] = "on"
 
         body = ormsgpack.packb(payload)
 
@@ -229,8 +202,9 @@ class TTSClient:
             "chunk_length": 200,
         }
 
-        if self._voice_enabled and self._references:
-            payload["references"] = self._references
+        if self._reference_id:
+            payload["reference_id"] = self._reference_id
+            payload["use_memory_cache"] = "on"
 
         body = ormsgpack.packb(payload)
 
@@ -337,8 +311,9 @@ class TTSClient:
             "normalize": True,
             "max_new_tokens": 1024,
         }
-        if self._voice_enabled and self._references:
-            payload["references"] = self._references
+        if self._reference_id:
+            payload["reference_id"] = self._reference_id
+            payload["use_memory_cache"] = "on"
 
         body = ormsgpack.packb(payload)
 
@@ -354,8 +329,8 @@ class TTSClient:
             elapsed = time.monotonic() - t_start
             if resp.status_code == 200:
                 logger.info(
-                    "TTS warmup OK: %d bytes in %.1fs (voice_cloning=%s)",
-                    len(resp.content), elapsed, self._voice_enabled,
+                    "TTS warmup OK: %d bytes in %.1fs (ref=%s)",
+                    len(resp.content), elapsed, self._reference_id or "default",
                 )
                 return True
             else:

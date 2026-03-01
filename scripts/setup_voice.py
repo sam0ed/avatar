@@ -6,13 +6,14 @@
 # ///
 """Upload voice recordings to the orchestrator and enable voice cloning.
 
-Calls the orchestrator's /voice/* REST endpoints — no SSH, no SCP.
-Works through any port mapping (direct or tunnel) as long as port 8000
-is reachable.
+All files are written to the shared filesystem under one reference_id
+via the orchestrator's POST /voice/reference endpoint.  Fish Speech
+loads all audio+lab pairs from references/<ref_id>/ at inference time.
 
 Usage:
     uv run scripts/setup_voice.py
     uv run scripts/setup_voice.py --url http://localhost:8000
+    uv run scripts/setup_voice.py --ref-id my-voice
     uv run scripts/setup_voice.py --recordings-dir recordings
     uv run scripts/setup_voice.py --disable
     uv run scripts/setup_voice.py --status
@@ -34,6 +35,7 @@ logging.basicConfig(
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RECORDINGS_DIR = PROJECT_ROOT / "recordings"
 DEFAULT_URL = "http://localhost:8000"
+DEFAULT_REF_ID = "my-voice"
 
 
 def find_recording_pairs(recordings_dir: Path) -> list[tuple[Path, str]]:
@@ -76,7 +78,7 @@ def check_health(base_url: str) -> bool:
 
 
 def get_voice_status(base_url: str) -> dict | None:
-    """Get current voice cloning status.
+    """Get current voice cloning status from the orchestrator.
 
     Args:
         base_url: Base URL of the orchestrator.
@@ -92,31 +94,51 @@ def get_voice_status(base_url: str) -> dict | None:
         return None
 
 
-def upload_reference(base_url: str, wav_path: Path, transcript: str) -> bool:
-    """Upload a single voice reference via the orchestrator.
+def list_references(base_url: str) -> dict[str, int]:
+    """List reference IDs and their audio file counts from the orchestrator.
+
+    Args:
+        base_url: Base URL of the orchestrator.
+
+    Returns:
+        Dict mapping ref_id to audio count.
+    """
+    try:
+        resp = httpx.get(f"{base_url}/voice/references", timeout=10.0)
+        if resp.status_code == 200:
+            return resp.json().get("references", {})
+        return {}
+    except Exception as e:
+        logger.error("Failed to list references: %s", e)
+        return {}
+
+
+def upload_reference(base_url: str, wav_path: Path, transcript: str, ref_id: str) -> bool:
+    """Upload a voice reference to the orchestrator's shared filesystem.
 
     Args:
         base_url: Base URL of the orchestrator.
         wav_path: Path to WAV audio file.
         transcript: Text spoken in the audio.
+        ref_id: Reference ID (folder name under /app/references/).
 
     Returns:
-        True if upload succeeded.
+        True on success.
     """
     audio_bytes = wav_path.read_bytes()
     size_kb = len(audio_bytes) / 1024
 
     resp = httpx.post(
         f"{base_url}/voice/reference",
+        data={"text": transcript, "ref_id": ref_id},
         files={"audio": (wav_path.name, audio_bytes, "audio/wav")},
-        data={"text": transcript},
         timeout=60.0,
     )
     if resp.status_code == 200:
         data = resp.json()
         logger.info(
-            "  Uploaded %s (%.0f KB, %d chars) — %d total refs",
-            wav_path.name, size_kb, len(transcript), data.get("reference_count", "?"),
+            "  Uploaded %s → '%s' (%.0f KB, %d chars) — %d audio(s) in folder",
+            wav_path.name, ref_id, size_kb, len(transcript), data.get("audio_count", "?"),
         )
         return True
     else:
@@ -127,22 +149,27 @@ def upload_reference(base_url: str, wav_path: Path, transcript: str) -> bool:
         return False
 
 
-def enable_voice(base_url: str) -> bool:
-    """Enable voice cloning and run warmup.
+def enable_voice(base_url: str, ref_id: str) -> bool:
+    """Enable voice cloning on the orchestrator and run warmup.
 
     Args:
         base_url: Base URL of the orchestrator.
+        ref_id: Reference ID (must exist on TTS server).
 
     Returns:
         True if enabled successfully.
     """
-    logger.info("Enabling voice cloning + warmup ...")
-    resp = httpx.post(f"{base_url}/voice/enable", timeout=180.0)
+    logger.info("Enabling voice cloning with ref_id='%s' + warmup ...", ref_id)
+    resp = httpx.post(
+        f"{base_url}/voice/enable",
+        params={"ref_id": ref_id},
+        timeout=180.0,
+    )
     data = resp.json()
     if data.get("enabled"):
         logger.info(
-            "  Voice cloning ON (%d refs, warmup=%s)",
-            data.get("reference_count", 0), data.get("warmup", "?"),
+            "  Voice cloning ON (ref=%s, warmup=%s)",
+            data.get("reference_id", "?"), data.get("warmup", "?"),
         )
         return True
     else:
@@ -151,7 +178,7 @@ def enable_voice(base_url: str) -> bool:
 
 
 def disable_voice(base_url: str) -> bool:
-    """Disable voice cloning.
+    """Disable voice cloning on the orchestrator.
 
     Args:
         base_url: Base URL of the orchestrator.
@@ -166,13 +193,17 @@ def disable_voice(base_url: str) -> bool:
 
 
 def main() -> None:
-    """Upload voice recordings and enable cloning via orchestrator endpoints."""
+    """Upload voice recordings to orchestrator and enable cloning."""
     parser = argparse.ArgumentParser(
         description="Upload voice recordings and enable voice cloning",
     )
     parser.add_argument(
         "--url", default=DEFAULT_URL,
         help=f"Orchestrator URL (default: {DEFAULT_URL})",
+    )
+    parser.add_argument(
+        "--ref-id", default=DEFAULT_REF_ID,
+        help=f"Reference ID — all recordings are stored under this ID (default: {DEFAULT_REF_ID})",
     )
     parser.add_argument(
         "--recordings-dir", type=Path, default=RECORDINGS_DIR,
@@ -201,13 +232,18 @@ def main() -> None:
         status = get_voice_status(args.url)
         if status:
             print(f"Voice cloning: {'ON' if status['enabled'] else 'OFF'}")
-            print(f"References loaded: {status['reference_count']}")
+            print(f"Reference ID: {status.get('reference_id', 'none')}")
+        refs = list_references(args.url)
+        if refs:
+            print(f"Available references: {refs}")
         return
 
     # Disable mode
     if args.disable:
         disable_voice(args.url)
         return
+
+    ref_id = args.ref_id
 
     if not args.skip_upload:
         # Find recording pairs
@@ -222,20 +258,26 @@ def main() -> None:
 
         logger.info("Found %d recording pairs in %s", len(pairs), args.recordings_dir)
 
-        # Upload each recording
-        success_count = 0
+        # Upload all recordings under a single ref_id
+        uploaded = 0
         for wav_path, transcript in pairs:
-            if upload_reference(args.url, wav_path, transcript):
-                success_count += 1
+            if upload_reference(args.url, wav_path, transcript, ref_id):
+                uploaded += 1
 
-        if success_count == 0:
+        if not uploaded:
             logger.error("All uploads failed")
             sys.exit(1)
 
-        logger.info("Uploaded %d/%d references", success_count, len(pairs))
+        logger.info("Uploaded %d/%d recordings under ref_id='%s'", uploaded, len(pairs), ref_id)
+    else:
+        refs = list_references(args.url)
+        if ref_id not in refs:
+            logger.error("Reference '%s' not found on server (available: %s)", ref_id, list(refs.keys()))
+            sys.exit(1)
+        logger.info("Using existing reference '%s' (%d audios)", ref_id, refs[ref_id])
 
-    # Enable voice cloning + warmup
-    if not enable_voice(args.url):
+    # Enable voice cloning + warmup on orchestrator
+    if not enable_voice(args.url, ref_id=ref_id):
         sys.exit(1)
 
     logger.info("")
