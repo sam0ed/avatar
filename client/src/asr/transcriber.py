@@ -201,6 +201,22 @@ class SpeechTranscriber:
         """Clear the raw audio ring buffer."""
         self._audio_buffer.clear()
 
+    def clear_queue(self) -> None:
+        """Flush all pending speech lines from the queue.
+
+        Useful after barge-in handling to discard stale transcriptions
+        (e.g., echo from speaker picked up by mic).
+        """
+        discarded = 0
+        while not self._line_queue.empty():
+            try:
+                self._line_queue.get_nowait()
+                discarded += 1
+            except asyncio.QueueEmpty:
+                break
+        if discarded:
+            logger.info("Cleared %d stale line(s) from queue", discarded)
+
     def _audio_callback(
         self,
         indata: np.ndarray,

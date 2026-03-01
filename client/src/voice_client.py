@@ -26,13 +26,19 @@ import logging
 import re
 import sys
 import time
+from pathlib import Path
+
+# Ensure the client/src package is importable when running as a script
+_SRC_DIR = Path(__file__).resolve().parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 import msgpack
 import websockets
 from websockets.asyncio.client import ClientConnection
 
-from src.asr.transcriber import SpeechTranscriber
-from src.audio.playback import AudioPlayer
+from asr.transcriber import SpeechTranscriber
+from audio.playback import AudioPlayer
 
 logger = logging.getLogger("avatar.voice_client")
 logging.basicConfig(
@@ -94,6 +100,7 @@ class VoiceClient:
         self._running = False
         self._use_smart_turn = use_smart_turn
         self._smart_turn = None  # SmartTurnAnalyzer, initialized in run()
+        self._chat_seq = 0  # Incrementing chat ID for message correlation
 
     async def connect(self) -> bool:
         """Establish WebSocket connection.
@@ -136,7 +143,7 @@ class VoiceClient:
         if not self._use_smart_turn:
             return True
         try:
-            from src.asr.smart_turn import SmartTurnAnalyzer
+            from asr.smart_turn import SmartTurnAnalyzer
 
             loop = asyncio.get_event_loop()
             self._smart_turn = await loop.run_in_executor(None, SmartTurnAnalyzer)
@@ -195,9 +202,13 @@ class VoiceClient:
             logger.error("Not connected")
             return None
 
+        self._chat_seq += 1
+        chat_id = str(self._chat_seq)
+
         msg = {
             "type": "chat",
             "data": text,
+            "chat_id": chat_id,
             "ts": time.time(),
         }
         await self._ws.send(msgpack.packb(msg))
@@ -256,7 +267,7 @@ class VoiceClient:
 
                     # 2) Tell server to cancel LLM + TTS pipeline
                     if self._ws:
-                        cancel_msg = {"type": "chat_cancel", "ts": time.time()}
+                        cancel_msg = {"type": "chat_cancel", "chat_id": chat_id, "ts": time.time()}
                         await self._ws.send(msgpack.packb(cancel_msg))
 
                     # 3) Drain remaining server messages until chat_done/chat_cancelled
@@ -267,6 +278,16 @@ class VoiceClient:
                 if recv_task in done:
                     raw = recv_task.result()
                     response = msgpack.unpackb(raw, raw=False)
+
+                    # Ignore stale messages from previous chat requests
+                    msg_chat_id = response.get("chat_id", chat_id)
+                    if msg_chat_id != chat_id:
+                        logger.debug(
+                            "Ignoring stale message (type=%s, chat_id=%s, expected=%s)",
+                            response.get("type"), msg_chat_id, chat_id,
+                        )
+                        continue
+
                     msg_type = response.get("type", "")
 
                     if msg_type == "chat_token":
@@ -468,6 +489,9 @@ class VoiceClient:
                 # — feed it straight into the next turn
                 if barge_in_text:
                     pending_text = barge_in_text
+                    # Clear any stale transcriptions from speaker echo
+                    self._transcriber.clear_queue()
+                    self._transcriber.clear_audio_buffer()
 
         except KeyboardInterrupt:
             print("\n")

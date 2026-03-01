@@ -198,8 +198,14 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             elif msg_type == "chat_cancel":
                 if chat_task is not None and not chat_task.done():
                     chat_task.cancel()
-                    logger.info("Chat cancel requested for %s", client_id)
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await chat_task
+                    logger.info("Chat cancel completed for %s", client_id)
+                elif chat_task is not None and chat_task.done():
+                    # Task already finished (chat_done sent) — no extra message needed.
+                    logger.info("Chat cancel for %s: task already done", client_id)
                 else:
+                    # No task exists — acknowledge immediately.
                     await ws.send_bytes(msgpack.packb({
                         "type": "chat_cancelled",
                         "server_ts": time.time(),
@@ -247,15 +253,17 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         msg: Parsed chat message with "data" field containing user text.
     """
     user_text = msg.get("data", "").strip()
+    chat_id = msg.get("chat_id", "")
     if not user_text:
         await ws.send_bytes(msgpack.packb({
             "type": "error",
             "message": "Empty chat message",
+            "chat_id": chat_id,
             "server_ts": time.time(),
         }))
         return
 
-    logger.info("Chat from %s: '%s'", client_id, user_text[:100])
+    logger.info("Chat from %s [%s]: '%s'", client_id, chat_id, user_text[:100])
 
     # Get or create chat session for this client
     if client_id not in _sessions:
@@ -283,6 +291,7 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
                         "type": "chat_audio",
                         "data": base64.b64encode(wav_chunk).decode("ascii"),
                         "sentence": sentence if chunk_idx == 0 else "",
+                        "chat_id": chat_id,
                         "server_ts": time.time(),
                     }))
                     chunk_idx += 1
@@ -302,6 +311,7 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
             await ws.send_bytes(msgpack.packb({
                 "type": "chat_token",
                 "data": token,
+                "chat_id": chat_id,
                 "server_ts": time.time(),
             }))
 
@@ -327,19 +337,21 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         await ws.send_bytes(msgpack.packb({
             "type": "chat_done",
             "full_text": assistant_text,
+            "chat_id": chat_id,
             "server_ts": time.time(),
         }))
 
         logger.info("Chat response to %s: %d chars, %d audio chunks", client_id, len(assistant_text), audio_chunk_count)
 
     except asyncio.CancelledError:
-        logger.info("Chat pipeline cancelled for %s", client_id)
+        logger.info("Chat pipeline cancelled for %s [%s]", client_id, chat_id)
         consumer_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await consumer_task
         try:
             await ws.send_bytes(msgpack.packb({
                 "type": "chat_cancelled",
+                "chat_id": chat_id,
                 "server_ts": time.time(),
             }))
         except Exception:
