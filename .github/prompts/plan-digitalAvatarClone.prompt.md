@@ -5,22 +5,22 @@ Build a self-hosted digital clone that captures your voice, generates conversati
 **Architecture overview:**
 
 ```
-LOCAL (RTX 3060 laptop, Windows)     VAST.AI (RTX 4090 24GB, Linux)
-┌─────────────────────────┐ WebSocket ┌──────────────────────────────────────┐
-│ Mic → Silero VAD (CPU) │───audio───────→│ Single container (supervisord)     │
-│ faster-whisper (GPU,2GB)│ │ ┌──────────────────────────────┐ │
-│ Orchestrator (Python) │───text────────→│ │ orchestrator (FastAPI :8000) │ │
-│ │ │ └──────┬───────────┬──────────┘ │
-│ │ │ │ │ │
-│ │ │ ┌──────▼─────┐ ┌───▼──────────┐ │
-│ │ │ │ LLM :8001  │ │ TTS :8080    │ │
-│ │ │ │ llama.cpp  │ │ Fish Speech  │ │
-│ │←──audio chunks─│ │ MamayLM 9B │ │ S1-mini      │ │
-│ │←──video frames─│ └────────────┘ └──────────────┘ │
-│ VB-Cable → Virtual Mic │ │ ┌──────────────────────┐ │
-│ pyvirtualcam → Zoom │ │ │ Face Anim (MuseTalk) │ │
-│ │ │ └──────────────────────┘ │
-└─────────────────────────┘ └──────────────────────────────────────┘
+LOCAL (RTX 3060 laptop, Windows)       VAST.AI (RTX 4090 24GB, Linux)
+┌───────────────────────────┐ WebSocket ┌──────────────────────────────────────┐
+│ Mic → Moonshine Voice    │           │ Single container (supervisord)       │
+│   (VAD+ASR, CPU, ONNX)  │───text───→│ ┌──────────────────────────────┐     │
+│ Orchestrator (Python)    │           │ │ orchestrator (FastAPI :8000) │     │
+│                          │           │ └──────┬───────────┬──────────┘     │
+│                          │           │        │           │                │
+│                          │           │ ┌──────▼─────┐ ┌───▼──────────┐    │
+│                          │           │ │ LLM :8001  │ │ TTS :8080    │    │
+│                          │           │ │ llama.cpp  │ │ Fish Speech  │    │
+│          ←──audio chunks─│           │ │ MamayLM 9B │ │ S1-mini      │    │
+│          ←──video frames─│           │ └────────────┘ └──────────────┘    │
+│ VB-Cable → Virtual Mic   │           │ ┌──────────────────────┐           │
+│ pyvirtualcam → Zoom      │           │ │ Face Anim (MuseTalk) │           │
+│                          │           │ └──────────────────────┘           │
+└───────────────────────────┘           └──────────────────────────────────────┘
 ```
 
 Server runs on a **Vast.ai Docker instance** — a single container with **supervisord** managing all services (LLM, TTS, face animation, orchestrator) as separate processes sharing the GPU. The image is pre-built and pushed to Docker Hub. Any service can be moved to a separate Vast.ai instance by changing one URL.
@@ -76,15 +76,18 @@ Total VRAM on Vast.ai: ~14-17GB (LLM ~5.5GB + TTS ~5GB + MuseTalk 4-6GB). Fits c
 
 ### Stage 3: Speech-to-Speech Conversation
 
-1. **Set up local ASR**: Install `faster-whisper` (large-v3-turbo, INT8 quantized, ~2GB VRAM) on your RTX 3060 (native Windows + CUDA). Pair with **Silero VAD** (CPU) for voice activity detection.
-2. **Implement the voice pipeline locally**:
+1. **Set up local ASR**: Install `moonshine-voice` (English Small Streaming, 123M params, ONNX, CPU-only — no GPU VRAM needed) on your Windows laptop. Moonshine Voice replaces faster-whisper + Silero VAD with a single integrated library handling VAD, segmentation, streaming ASR, and turn detection via `LineCompleted` events.
+2. **Create the ASR wrapper** (`client/src/asr/transcriber.py`): Use Moonshine's `Transcriber` (not `MicTranscriber`) with manual audio feeding from `sounddevice.InputStream`. The `TranscriptEventListener.on_line_completed()` callback fires when Moonshine's built-in VAD detects a speech pause — this is the turn-end signal. Bridge from Moonshine's callback thread to asyncio via `loop.call_soon_threadsafe`.
+3. **Create audio playback with cancel** (`client/src/audio/playback.py`): Extract and enhance `ChatClient._play_audio_queue()` into a standalone `AudioPlayer` class with `cancel()` method for future barge-in support.
+4. **Add `chat_cancel` to server** (`server/src/api/server.py`): Run `_handle_chat` as a background `asyncio.Task` so the WebSocket message loop stays responsive. Handle `chat_cancel` message type by cancelling the task. Handle `asyncio.CancelledError` gracefully in the chat pipeline.
+5. **Implement the voice pipeline** (`client/src/voice_client.py`):
    - Continuously capture mic audio via `sounddevice`
-   - Feed into Silero VAD to detect speech segments (start/end of utterance)
-   - On utterance end → transcribe with faster-whisper locally
-   - Send transcription text over WebSocket to Vast.ai server
-   - Receive audio chunks back → play through speakers (or VB-Cable)
-3. **Handle turn-taking**: Implement a simple state machine — `LISTENING` → `PROCESSING` → `SPEAKING` → `LISTENING`. Mute mic input while avatar is speaking to avoid feedback loops.
-4. **Verification**: Have a full voice conversation with your clone. Speak naturally, hear responses in your voice. Measure end-to-end latency (target: 1.5-2.5s from end of speech to first audio).
+   - Feed into Moonshine Transcriber for VAD + ASR
+   - On `LineCompleted` → mute mic, send transcription text over WebSocket to Vast.ai server
+   - Receive streaming tokens + audio chunks back → display + play through speakers
+   - After playback finishes → unmute mic, return to listening
+6. **Handle turn-taking**: Simple state machine — `LISTENING` → `PROCESSING` → `SPEAKING` → `LISTENING`. Mute mic input while avatar is speaking to avoid feedback loops. Barge-in (V2) will require keeping mic active with echo cancellation or headset.
+7. **Verification**: Have a full voice conversation with your clone. Speak naturally, hear responses in your voice. Measure end-to-end latency (target: 1.5–2.5s from end of speech to first audio). ASR latency should be ~73ms (Small Streaming on MacBook, ~165ms on Linux x86).
 
 ### Stage 4: Face Animation
 
@@ -152,7 +155,7 @@ Total VRAM on Vast.ai: ~14-17GB (LLM ~5.5GB + TTS ~5GB + MuseTalk 4-6GB). Fits c
 | TTS | OpenAudio S1-mini (0.5B) | #1 TTS-Arena2, streaming, zero-shot cloning, 2-3GB VRAM, emotion control |
 | LLM | MamayLM (Gemma 2 9B, GGUF Q4_K_M) via llama-cpp-python | SOTA Ukrainian (beats 10x larger models), strong English, fine-tunable with QLoRA. Official GGUF quants from INSAIT. llama.cpp chosen over vLLM (vLLM GGUF is experimental/slow). ~5.5GB VRAM, 120-150 tok/s on RTX 4090. |
 | Face Animation | MuseTalk | Only real-time option at sufficient quality (~30 FPS); LivePortrait as future upgrade |
-| ASR | faster-whisper large-v3-turbo + Silero VAD | Runs locally on RTX 3060 Windows (2GB VRAM), saves ~100ms network hop |
+| ASR | Moonshine Voice (English Small Streaming, 123M, ONNX CPU) | Integrated VAD + streaming ASR + turn detection in one library. 73ms response latency (MacBook). CPU-only — frees local GPU. Replaces faster-whisper + Silero VAD. |
 | Communication | WebSocket (binary/msgpack) | Simpler than WebRTC, sufficient for 1-2s latency target |
 | Vast.ai GPU | RTX 4090 24GB | All server models fit in ~16-19GB, cost-effective at ~$0.40/hr |
 | Deployment | Vast.ai Docker instance + git clone onstart-cmd | Same off-the-shelf base image as Stage 1. Short onstart-cmd (~700 chars) git clones public GitHub repo — no custom image build/push needed. Supervisord manages all services. Can move any service to a separate GPU by changing one URL. |
@@ -177,8 +180,8 @@ Total VRAM on Vast.ai: ~14-17GB (LLM ~5.5GB + TTS ~5GB + MuseTalk 4-6GB). Fits c
 
 | Component | Tool | Runs On | VRAM |
 |-----------|------|---------|------|
-| Voice Activity Detection | Silero VAD | Local (CPU) | 0 |
-| Speech-to-Text | faster-whisper large-v3-turbo | Local (GPU) | ~2GB |
+| Voice Activity Detection | Moonshine Voice (built-in) | Local (CPU) | 0 |
+| Speech-to-Text | Moonshine Voice English Small Streaming (123M, ONNX) | Local (CPU) | 0 |
 | LLM | MamayLM (Gemma 2 9B, GGUF Q4_K_M) via llama-cpp-python | Vast.ai | ~5.5GB |
 | Text-to-Speech | OpenAudio S1-mini (0.5B) | Vast.ai | ~5GB |
 | Face Animation | MuseTalk | Vast.ai | ~4-6GB |

@@ -6,6 +6,7 @@ Stage 2: LLM + TTS conversational pipeline (streaming).
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
 import time
@@ -156,10 +157,13 @@ async def websocket_endpoint(ws: WebSocket) -> None:
       - ping → pong (heartbeat)
       - echo → echo_reply (connectivity test)
       - chat → streams back: chat_token, chat_audio, chat_done
+      - chat_cancel → cancels ongoing chat, sends chat_cancelled
     """
     await ws.accept()
     client_id = _get_client_id(ws)
     logger.info("Client connected: %s", client_id)
+
+    chat_task: asyncio.Task | None = None
 
     try:
         while True:
@@ -184,7 +188,22 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 await ws.send_bytes(msgpack.packb(response))
 
             elif msg_type == "chat":
-                await _handle_chat(ws, client_id, msg)
+                # Cancel any existing chat before starting a new one
+                if chat_task is not None and not chat_task.done():
+                    chat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await chat_task
+                chat_task = asyncio.create_task(_handle_chat(ws, client_id, msg))
+
+            elif msg_type == "chat_cancel":
+                if chat_task is not None and not chat_task.done():
+                    chat_task.cancel()
+                    logger.info("Chat cancel requested for %s", client_id)
+                else:
+                    await ws.send_bytes(msgpack.packb({
+                        "type": "chat_cancelled",
+                        "server_ts": time.time(),
+                    }))
 
             else:
                 response = {
@@ -196,9 +215,13 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
     except WebSocketDisconnect:
         logger.info("Client disconnected: %s", client_id)
+        if chat_task is not None and not chat_task.done():
+            chat_task.cancel()
         _sessions.pop(client_id, None)
     except Exception:
         logger.exception("WebSocket error for %s", client_id)
+        if chat_task is not None and not chat_task.done():
+            chat_task.cancel()
         _sessions.pop(client_id, None)
         await ws.close(code=1011, reason="Internal server error")
 
@@ -308,6 +331,19 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         }))
 
         logger.info("Chat response to %s: %d chars, %d audio chunks", client_id, len(assistant_text), audio_chunk_count)
+
+    except asyncio.CancelledError:
+        logger.info("Chat pipeline cancelled for %s", client_id)
+        consumer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer_task
+        try:
+            await ws.send_bytes(msgpack.packb({
+                "type": "chat_cancelled",
+                "server_ts": time.time(),
+            }))
+        except Exception:
+            pass  # WebSocket may already be closed
 
     except Exception:
         logger.exception("Chat pipeline error for %s", client_id)

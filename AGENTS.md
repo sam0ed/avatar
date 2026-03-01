@@ -54,10 +54,14 @@ avatar/
 ├── client/                   # Local Windows orchestrator
 │   ├── pyproject.toml        # uv-managed dependencies
 │   ├── src/
-│   │   ├── asr/              # faster-whisper + Silero VAD (future)
-│   │   ├── audio/            # sounddevice capture/playback
+│   │   ├── asr/
+│   │   │   ├── transcriber.py     # Moonshine Voice ASR wrapper (VAD+ASR, CPU)
+│   │   │   └── smart_turn.py      # Smart Turn v3.2 ONNX end-of-turn detector
+│   │   ├── audio/
+│   │   │   └── playback.py        # Audio player with cancel support
 │   │   ├── video/            # pyvirtualcam output (future)
 │   │   ├── orchestrator.py   # Main pipeline coordinator
+│   │   ├── voice_client.py   # Voice conversation client (mic → ASR → LLM → TTS → speaker)
 │   │   ├── chat_client.py    # Terminal chat client with audio playback
 │   │   └── tts_test.py       # Fish Speech TTS test client
 ├── scripts/
@@ -108,16 +112,17 @@ avatar/
 - Models downloaded at first boot by `entrypoint_stage2.sh` (~5.76GB LLM + ~3.6GB TTS)
 - LLM API: OpenAI-compatible at port 8001 (`/v1/chat/completions` with SSE streaming)
 - Pipeline: WebSocket `chat` msg → stream LLM tokens → sentence chunking → parallel TTS synthesis → audio back to client
-- Voice references: Upload manually via TTS API after deploy (see Stage 1 notes)
+- Voice references: Upload via orchestrator's `POST /voice/reference` endpoint (writes WAV+lab directly to `/app/references/<ref_id>/`, supports multiple files). Enable via `POST /voice/enable?ref_id=<id>`. Script: `uv run scripts/setup_voice.py --url http://localhost:8000`
 - Client: `client/src/chat_client.py` — multi-turn terminal chat with real-time token display + audio playback
 - Logs: `ssh -p <port> root@<host> 'supervisorctl status'` or `'tail -f /var/log/supervisor/*.log'`
 
 ## Current Stage
 
-**Stage 2: LLM + TTS Conversational Pipeline** — IMPLEMENTED, PENDING DEPLOYMENT
+**Stage 3: Speech-to-Speech Conversation** — IN PROGRESS
 
-All Stage 2 code written: supervisord config, entrypoint, LLM client with SSE streaming, TTS client (async), sentence chunker, chat WebSocket handler, terminal chat client, and deploy script (onstart-cmd approach — no custom Docker image needed).
-Next: Deploy to Vast.ai using `deploy_stage2.py`, verify end-to-end (type text → hear cloned voice response). Target: first audio chunk within ~1-1.5s, LLM ≥100 tok/s.
+Core voice loop implemented. Moonshine Voice ASR + barge-in with pre-filters + Smart Turn v3.2 end-of-turn detection. New files: `client/src/asr/transcriber.py` (SpeechTranscriber with speech duration tracking + audio ring buffer), `client/src/asr/smart_turn.py` (SmartTurnAnalyzer — ONNX inference), `client/src/audio/playback.py` (AudioPlayer with cancel), `client/src/voice_client.py` (VoiceClient — full voice conversation loop with barge-in pre-filters + Smart Turn). Server updated: chat runs as background asyncio task, `chat_cancel` message type for barge-in. Pending: end-to-end testing with Vast.ai server.
+
+
 
 ## Progress Log
 
@@ -129,6 +134,10 @@ Next: Deploy to Vast.ai using `deploy_stage2.py`, verify end-to-end (type text �
 | 2026-02-21 | Stage 2 | Implementation: supervisord config + entrypoint for unified container. Server-side: async LLM client with SSE streaming (`server/src/llm/client.py`), async TTS client (`server/src/tts/client.py`), sentence chunker (`server/src/llm/chunker.py`), chat WebSocket handler in `server/src/api/server.py`. Client-side: multi-turn terminal chat client with audio playback (`client/src/chat_client.py`). Placeholder system prompt created. Widened `server/pyproject.toml` Python constraint to `>=3.11` for Fish Speech image compatibility. |
 | 2026-02-22 | Stage 2 | Attempted multiple deploy approaches: (1) base64 tarball in onstart-cmd — hit Windows 32K char CreateProcess limit; (2) onstart file — hit Vast.ai 4048-char API limit; (3) custom Docker image with BuildKit — base image layers re-uploaded every push due to OCI format recompression (~5GB on 7Mbps upload); (4) legacy Docker builder — same re-upload issue. Final approach: git clone from public GitHub repo in a short onstart-cmd (~700 chars). Created Dockerfile.stage2 (kept for reference), .dockerignore. Made repo public. |
 | 2026-02-26 | Stage 2 | Rewrote `deploy_stage2.py` for git clone approach: removed Docker build+push logic, uses off-the-shelf `fishaudio/fish-speech:server-cuda` image, onstart-cmd (~750 chars) git clones repo + installs deps + runs entrypoint. Set up GitHub remote, pushed all code to `sam0ed/avatar` (public). Ready for deployment. |
+| 2026-03-01 | Stage 2 | **Stage 2 COMPLETE.** Voice cloning via filesystem-based multi-file references (`setup_voice.py`). Optimized first audio from ~2.5s → **1.0–1.6s** (server-side reference caching, persistent httpx pool, smaller PCM buffer). End-to-end verified. |
+| 2026-03-XX | Stage 3 | Implementation: Moonshine Voice ASR wrapper (`client/src/asr/transcriber.py`), audio player with cancel (`client/src/audio/playback.py`), voice conversation client (`client/src/voice_client.py`). Server restructured: chat as background task + `chat_cancel` message type (`server/src/api/server.py`). Mic muting during playback (no barge-in V1). Plan + architecture diagram updated. |
+| 2026-03-01 | Stage 3 | **Barge-in implemented.** Mic stays active during avatar speech — Moonshine VAD detects user interruption → cancels playback (`AudioPlayer.cancel()`) + server pipeline (`chat_cancel`) → barge-in text feeds directly into next turn. Relies on laptop mic's built-in echo cancellation to filter speaker output. Researched Pipecat, LiveKit, Vocode barge-in architectures (see `docs/research-asr-turn-taking.md`). |
+| 2026-03-01 | Stage 3 | **Barge-in pre-filters + Smart Turn.** Added three pre-filters to reduce false interruptions: backchannel regex (mhm/yeah/okay/etc.), `MIN_INTERRUPTION_WORDS=2`, `MIN_INTERRUPTION_DURATION=0.5s`. Filtered speech is silently ignored (zero audio disruption). Added Smart Turn v3.2 ONNX end-of-turn detection (`client/src/asr/smart_turn.py`): analyzes prosody on up to 8s audio after Moonshine VAD silence, accumulates speech segments until turn complete or 3s timeout. New deps: `transformers>=4.40`, `onnxruntime>=1.17`, `huggingface-hub>=0.23`. Pause/resume and preemptive generation deferred. |
 
 ## Important Decisions & Context
 
@@ -143,7 +152,17 @@ Next: Deploy to Vast.ai using `deploy_stage2.py`, verify end-to-end (type text �
 - **Pre-built CUDA wheels for llama-cpp-python**: Instead of compiling from source (which requires nvcc/devel image), use pre-built wheels from `https://abetlen.github.io/llama-cpp-python/whl/cu126`. This allows using the Fish Speech `runtime` base image without CUDA dev tools.
 - **Sentence-level TTS streaming**: LLM tokens are accumulated and split at sentence boundaries (`.!?…`) before dispatching to TTS. This avoids waiting for the full LLM response, achieving first audio within ~1-1.5s.
 - **OpenAudio S1-mini over alternatives**: Successor to Fish Speech v1.5. #1 on TTS-Arena2, 0.5B params (~2-3GB VRAM), zero-shot voice cloning, streaming (RTF ~1:7 on 4090), Apache-2.0 code + CC-BY-NC-SA-4.0 weights (fine for personal use). Evaluated Orpheus 3B, XTTS v2, Kokoro, MaskGCT, StyleTTS2-Ukrainian, Piper — S1-mini is the best fit for quality, VRAM, and streaming.
-- **ASR runs locally**: faster-whisper on RTX 3060 (2GB VRAM) to save ~100ms network round trip.
+- **Moonshine Voice over faster-whisper**: Moonshine Voice English Small Streaming (123M, ONNX) replaces faster-whisper + Silero VAD. Single library handles both VAD and ASR. Runs on CPU only (0 VRAM), 73ms latency, built-in turn detection. Uses `Transcriber` (manual audio feeding) over `MicTranscriber` for mute/unmute control without session restart and no sounddevice conflicts. See `docs/research-asr-turn-taking.md` for full comparison of Moonshine Small (73ms, 7.84% WER), Moonshine Medium (107ms, 6.65% WER), Moonshine Base Ukrainian (14.55% WER), faster-whisper, RealtimeSTT, Distil-Whisper.
+- **ASR runs locally**: Moonshine Voice on CPU to save ~100ms network round trip. Frees GPU VRAM entirely for other tasks.
+- **Turn-taking V1 (Moonshine built-in)**: Moonshine's `LineCompleted` event used as turn boundary. VAD segments speech into "lines" with natural pause detection. Configurable `vad_threshold`, `vad_window_duration`. May split long compound sentences mid-thought — acceptable for V1.
+- **Turn-taking V2 (Smart Turn — IMPLEMENTED)**: Pipecat Smart Turn v3.2 ONNX model (~8M params, Whisper Tiny backbone, BSD-2-Clause). Runs after Moonshine VAD silence, classifies "complete turn" vs "incomplete turn" on last 8s of audio. ~10-65ms CPU inference. 23 languages incl Ukrainian. Uses `WhisperFeatureExtractor(chunk_length=8)` from `transformers` (no torch required). Model auto-downloaded from `pipecat-ai/smart-turn-v3` on HuggingFace (~8MB, cached). Disableable via `--no-smart-turn` CLI flag. If turn incomplete, waits for more speech (3s timeout fallback).
+- **Barge-in V1 (none)**: Mic muted during PROCESSING/SPEAKING. User must wait for avatar to finish. Avoids echo cancellation complexity.
+- **Barge-in V2a (headphone VAD)**: Keep mic active during playback, use Moonshine VAD to detect user speech. On `line_started` → cancel playback + server task. Requires headphones (no echo). Simplest, most reliable. ~30 lines changed.
+- **Barge-in pre-filters (IMPLEMENTED)**: Three-layer filtering before treating speech as interruption: (1) backchannel regex (mhm, yeah, okay, sure, right, etc.), (2) `MIN_INTERRUPTION_WORDS=2`, (3) `MIN_INTERRUPTION_DURATION=0.5s`. Filtered speech causes zero audio disruption — playback continues uninterrupted, barge-in listener restarts. Pause/resume approach (LiveKit style) deferred — pre-filters handle the common case without any audio glitch.
+- **Barge-in V2b (pause/resume — DEFERRED)**: LiveKit/Pipecat pattern — PAUSE playback on VAD trigger, wait 0.5-1s for ASR to confirm real words. If real speech → fully cancel. If noise/echo → resume playback. Would require `pause()`/`resume()` in AudioPlayer. Not needed with current pre-filter approach.
+- **Barge-in V2c (energy-gate, optional)**: For speaker-only use without WebRTC. RMS energy monitoring in audio callback — gate audio forwarding to Moonshine during playback. User voice near mic is louder than speaker echo. Only needed if speakers must be supported before WebRTC migration.
+- **Barge-in framework research**: Studied Pipecat v0.0.99+ (VAD start strategies, Smart Turn v3 default stop, 5 user mute strategies), LiveKit Agents (AEC warmup 3.0s, false-interruption pause/resume, min_interruption_words/duration), Vocode (mute_during_speech, backchannel regex filtering, interrupt_sensitivity). All rely on transport-layer WebRTC AEC — no framework provides standalone local AEC. See `docs/research-asr-turn-taking.md` for full analysis.
+- **No open-source AEC for local Python on Windows**: Evaluated speexdsp, webrtc-audio-processing, pyaec, PINTO0309/onnx-aec, Pipecat filters. None viable. WebRTC will handle AEC when we move to browser-based I/O.
 - **Single Vast.ai GPU**: All server models (LLM + TTS + MuseTalk) coexist on one RTX 4090 (~14-17GB total VRAM) in a single Docker container. Can scale by moving a service to a separate Vast.ai instance (change one URL).
 - **Latency budget**: 1.5-2.5s end-to-end from end of speech to first avatar response is acceptable.
 - **Docker base image**: Switched from `nvidia/cuda:12.1.1-devel` (~12GB) to `python:3.11-slim-bookworm` (1.07GB). Neither Fish Speech nor MuseTalk compile CUDA code — pre-compiled PyTorch wheels, mmcv ships pre-built wheels.

@@ -1,7 +1,15 @@
 """Avatar client orchestrator — main pipeline coordinator.
 
-Stage 0: Basic structure with WebSocket connection management.
-Later stages add: ASR → LLM → TTS → face animation pipeline.
+Stage 0–3: WebSocket connection + ASR + voice conversation pipeline.
+
+The orchestrator manages the high-level state machine:
+    IDLE → LISTENING → PROCESSING → SPEAKING → LISTENING → ...
+
+For voice conversation, use VoiceClient directly:
+    uv run python src/voice_client.py ws://HOST:PORT/ws
+
+This module provides the state machine and connection management
+that will grow to encompass video/face animation in later stages.
 
 Run with: uv run python src/orchestrator.py [server_url]
 """
