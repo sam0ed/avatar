@@ -83,6 +83,8 @@ class TTSClient:
         self.output_format = output_format
         self.timeout = timeout
         self._reference_id: str | None = None
+        # Persistent connection pool — avoids TCP handshake per request
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
 
     @property
     def voice_enabled(self) -> bool:
@@ -115,13 +117,12 @@ class TTSClient:
             True if server responds OK.
         """
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.base_url}/v1/health",
-                    timeout=10.0,
-                )
-                data = resp.json()
-                return data.get("status") == "ok"
+            resp = await self._http.get(
+                f"{self.base_url}/v1/health",
+                timeout=10.0,
+            )
+            data = resp.json()
+            return data.get("status") == "ok"
         except Exception as e:
             logger.error("TTS health check failed: %s", e)
             return False
@@ -154,25 +155,23 @@ class TTSClient:
         body = ormsgpack.packb(payload)
 
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.base_url}/v1/tts",
-                    content=body,
-                    headers={"Content-Type": "application/msgpack"},
-                    timeout=self.timeout,
-                )
+            resp = await self._http.post(
+                f"{self.base_url}/v1/tts",
+                content=body,
+                headers={"Content-Type": "application/msgpack"},
+            )
 
-                if resp.status_code == 200:
-                    logger.info(
-                        "TTS synthesized %d bytes for '%s' (%d chars)",
-                        len(resp.content),
-                        text[:50],
-                        len(text),
-                    )
-                    return resp.content
-                else:
-                    logger.error("TTS failed (%d): %s", resp.status_code, resp.text[:500])
-                    return None
+            if resp.status_code == 200:
+                logger.info(
+                    "TTS synthesized %d bytes for '%s' (%d chars)",
+                    len(resp.content),
+                    text[:50],
+                    len(text),
+                )
+                return resp.content
+            else:
+                logger.error("TTS failed (%d): %s", resp.status_code, resp.text[:500])
+                return None
         except Exception as e:
             logger.error("TTS request failed: %s", e)
             return None
@@ -210,88 +209,86 @@ class TTSClient:
 
         try:
             t_start = time.monotonic()
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST",
-                    f"{self.base_url}/v1/tts",
-                    content=body,
-                    headers={"Content-Type": "application/msgpack"},
-                    timeout=self.timeout,
-                ) as resp:
-                    if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        logger.error(
-                            "TTS streaming failed (%d): %s",
-                            resp.status_code,
-                            error_body[:500],
-                        )
-                        return
-
-                    # Fish Speech streaming returns raw PCM (no WAV
-                    # header).  We know the format from the non-streaming
-                    # endpoint: 44100 Hz, mono, 16-bit signed LE.
-                    sample_rate = 44100
-                    channels = 1
-                    sample_width = 2  # bytes per sample
-                    # ~0.2s of audio as minimum yield threshold
-                    min_chunk_bytes = max(
-                        sample_rate * channels * sample_width // 5,
-                        3200,
+            async with self._http.stream(
+                "POST",
+                f"{self.base_url}/v1/tts",
+                content=body,
+                headers={"Content-Type": "application/msgpack"},
+            ) as resp:
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    logger.error(
+                        "TTS streaming failed (%d): %s",
+                        resp.status_code,
+                        error_body[:500],
                     )
-                    pcm_buffer = b""
-                    total_pcm = 0
-                    t_first_byte: float | None = None
-                    chunk_count = 0
+                    return
 
-                    async for raw_chunk in resp.aiter_bytes():
-                        if t_first_byte is None:
-                            t_first_byte = time.monotonic()
-                        pcm_buffer += raw_chunk
+                # Fish Speech streaming returns raw PCM (no WAV
+                # header).  We know the format from the non-streaming
+                # endpoint: 44100 Hz, mono, 16-bit signed LE.
+                sample_rate = 44100
+                channels = 1
+                sample_width = 2  # bytes per sample
+                # ~0.1s of audio as minimum yield threshold
+                min_chunk_bytes = max(
+                    sample_rate * channels * sample_width // 10,
+                    3200,
+                )
+                pcm_buffer = b""
+                total_pcm = 0
+                t_first_byte: float | None = None
+                chunk_count = 0
 
-                        # Yield when we have enough PCM data
-                        while len(pcm_buffer) >= min_chunk_bytes:
-                            chunk = pcm_buffer[:min_chunk_bytes]
-                            pcm_buffer = pcm_buffer[min_chunk_bytes:]
-                            wav_data = (
-                                _make_wav_header(
-                                    len(chunk),
-                                    sample_rate,
-                                    channels,
-                                    sample_width,
-                                )
-                                + chunk
-                            )
-                            total_pcm += len(chunk)
-                            chunk_count += 1
-                            yield wav_data
+                async for raw_chunk in resp.aiter_bytes():
+                    if t_first_byte is None:
+                        t_first_byte = time.monotonic()
+                    pcm_buffer += raw_chunk
 
-                    # Flush remaining PCM data
-                    if pcm_buffer:
+                    # Yield when we have enough PCM data
+                    while len(pcm_buffer) >= min_chunk_bytes:
+                        chunk = pcm_buffer[:min_chunk_bytes]
+                        pcm_buffer = pcm_buffer[min_chunk_bytes:]
                         wav_data = (
                             _make_wav_header(
-                                len(pcm_buffer),
+                                len(chunk),
                                 sample_rate,
                                 channels,
                                 sample_width,
                             )
-                            + pcm_buffer
+                            + chunk
                         )
-                        total_pcm += len(pcm_buffer)
+                        total_pcm += len(chunk)
                         chunk_count += 1
                         yield wav_data
 
-                    t_end = time.monotonic()
-                    t_fb = (t_first_byte - t_start) if t_first_byte else -1
-                    logger.info(
-                        "TTS streamed %d bytes (%d chunks) for '%s' (%d chars) "
-                        "— first byte %.2fs, total %.2fs",
-                        total_pcm,
-                        chunk_count,
-                        text[:50],
-                        len(text),
-                        t_fb,
-                        t_end - t_start,
+                # Flush remaining PCM data
+                if pcm_buffer:
+                    wav_data = (
+                        _make_wav_header(
+                            len(pcm_buffer),
+                            sample_rate,
+                            channels,
+                            sample_width,
+                        )
+                        + pcm_buffer
                     )
+                    total_pcm += len(pcm_buffer)
+                    chunk_count += 1
+                    yield wav_data
+
+                t_end = time.monotonic()
+                t_fb = (t_first_byte - t_start) if t_first_byte else -1
+                logger.info(
+                    "TTS streamed %d bytes (%d chunks) for '%s' (%d chars) "
+                    "— first byte %.2fs, total %.2fs",
+                    total_pcm,
+                    chunk_count,
+                    text[:50],
+                    len(text),
+                    t_fb,
+                    t_end - t_start,
+                )
         except Exception as e:
             logger.error("TTS streaming request failed: %s", e)
 
@@ -319,13 +316,12 @@ class TTSClient:
 
         try:
             t_start = time.monotonic()
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.base_url}/v1/tts",
-                    content=body,
-                    headers={"Content-Type": "application/msgpack"},
-                    timeout=120.0,
-                )
+            resp = await self._http.post(
+                f"{self.base_url}/v1/tts",
+                content=body,
+                headers={"Content-Type": "application/msgpack"},
+                timeout=120.0,
+            )
             elapsed = time.monotonic() - t_start
             if resp.status_code == 200:
                 logger.info(
