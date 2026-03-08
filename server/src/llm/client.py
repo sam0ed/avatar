@@ -35,6 +35,7 @@ class ChatSession:
 
     messages: list[ChatMessage] = field(default_factory=list)
     system_prompt: str = ""
+    was_interrupted: bool = False
 
     def __post_init__(self) -> None:
         """Load system prompt if not provided."""

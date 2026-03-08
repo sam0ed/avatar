@@ -274,6 +274,17 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     if client_id not in _sessions:
         _sessions[client_id] = ChatSession()
     session = _sessions[client_id]
+
+    # If the previous response was interrupted, prepend context so the LLM
+    # knows not to repeat itself.
+    if session.was_interrupted:
+        user_text = (
+            "[System: your previous response was cut short because the user"
+            " interrupted you. Don't repeat what you already said.]\n"
+            + user_text
+        )
+        session.was_interrupted = False
+
     session.add_user_message(user_text)
 
     # Stream LLM → chunk into sentences → stream-synthesize each sentence
@@ -361,8 +372,9 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         # Gemma 2 (and most chat models) produce 0 tokens.
         partial_text = "".join(full_response)
         if partial_text:
-            # Save whatever was generated before the cancel, marked as interrupted
-            session.add_assistant_message(partial_text.rstrip() + " [interrupted]")
+            # Save whatever was generated before the cancel
+            session.add_assistant_message(partial_text)
+            session.was_interrupted = True
             logger.info(
                 "Saved partial response (%d chars) for %s [%s]",
                 len(partial_text), client_id, chat_id,
