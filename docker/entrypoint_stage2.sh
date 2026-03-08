@@ -64,10 +64,65 @@ else
     echo "[2/2] TTS model already cached at ${TTS_CHECKPOINT}"
 fi
 
-# --- 3. Prepare directories ---
-mkdir -p /app/references /var/log/supervisor
+# --- 3. MuseTalk venv + models ---
+export FACE_ENABLED="${FACE_ENABLED:-false}"
+if [ "$FACE_ENABLED" = "true" ]; then
+    MUSETALK_DIR="/opt/musetalk"
+    MUSETALK_VENV="/opt/musetalk-venv"
 
-# --- 3.5. Ensure libcuda.so symlink for torch.compile/Triton ---
+    if [ ! -d "$MUSETALK_DIR" ]; then
+        echo ""
+        echo "[3a] Cloning MuseTalk ..."
+        git clone --depth 1 https://github.com/TMElyralab/MuseTalk.git "$MUSETALK_DIR"
+    else
+        echo "[3a] MuseTalk already cloned at $MUSETALK_DIR"
+    fi
+
+    if [ ! -d "$MUSETALK_VENV" ]; then
+        echo "[3b] Creating MuseTalk venv + installing deps ..."
+        python3.11 -m venv "$MUSETALK_VENV"
+        "$MUSETALK_VENV/bin/pip" install --upgrade pip
+        "$MUSETALK_VENV/bin/pip" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+        "$MUSETALK_VENV/bin/pip" install -r "$MUSETALK_DIR/requirements.txt"
+        "$MUSETALK_VENV/bin/pip" install openmim
+        "$MUSETALK_VENV/bin/mim" install mmengine "mmcv==2.0.1" "mmdet==3.1.0" "mmpose==1.1.0"
+        "$MUSETALK_VENV/bin/pip" install fastapi uvicorn python-multipart opencv-python-headless librosa openai-whisper
+    else
+        echo "[3b] MuseTalk venv already exists at $MUSETALK_VENV"
+    fi
+
+    # Download MuseTalk models
+    MUSETALK_CKPT="$MUSETALK_DIR/models/musetalk/musetalk.json"
+    if [ ! -f "$MUSETALK_CKPT" ]; then
+        echo "[3c] Downloading MuseTalk models ..."
+        "$MUSETALK_VENV/bin/python" -c "
+from huggingface_hub import snapshot_download
+import os
+# MuseTalk weights (v1.0 + v1.5)
+snapshot_download('TMElyralab/MuseTalk', local_dir='$MUSETALK_DIR/models/musetalk')
+# SD-VAE
+snapshot_download('stabilityai/sd-vae-ft-mse', local_dir='$MUSETALK_DIR/models/sd-vae-ft-mse')
+# DWPose
+snapshot_download('yzd-v/DWPose', local_dir='$MUSETALK_DIR/models/dwpose', allow_patterns=['*.pth'])
+# Face parsing
+snapshot_download('musetalk/face-parse-bisenet', local_dir='$MUSETALK_DIR/models/face-parse-bisenet')
+print('MuseTalk model download complete.')
+"
+    else
+        echo "[3c] MuseTalk models already cached"
+    fi
+
+    # Copy face_server.py from orchestrator repo
+    cp /app/orchestrator/src/face/face_server.py "$MUSETALK_DIR/face_server.py"
+    echo "[3d] MuseTalk setup complete"
+else
+    echo "[3] FACE_ENABLED=false, skipping MuseTalk setup"
+fi
+
+# --- 4. Prepare directories ---
+mkdir -p /app/references /app/avatars /var/log/supervisor
+
+# --- 4.5. Ensure libcuda.so symlink for torch.compile/Triton ---
 # The runtime image has libcuda.so.1 (from NVIDIA container toolkit) but
 # Triton's gcc link step needs plain libcuda.so in the linker search path.
 if [ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so ]; then
@@ -78,12 +133,12 @@ if [ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so ]; then
     fi
 fi
 
-# --- 4. Start all services via supervisord ---
+# --- 5. Start all services via supervisord ---
 echo ""
 echo "Starting services via supervisord ..."
 /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
 
-# --- 5. Warmup TTS (torch.compile first-request penalty ~30-60s) ---
+# --- 6. Warmup TTS (torch.compile first-request penalty ~30-60s) ---
 echo ""
 echo "Waiting for TTS server to be ready ..."
 for i in $(seq 1 60); do
@@ -102,6 +157,19 @@ curl -sf -X POST http://localhost:8080/v1/tts \
     -o /dev/null || echo "Warmup request failed (non-fatal)"
 WARMUP_END=$(date +%s)
 echo "TTS warmup completed in $((WARMUP_END - WARMUP_START))s"
+
+# --- 7. Warmup MuseTalk (if enabled) ---
+if [ "$FACE_ENABLED" = "true" ]; then
+    echo ""
+    echo "Waiting for MuseTalk server to be ready ..."
+    for i in $(seq 1 90); do
+        if curl -sf http://localhost:8002/health > /dev/null 2>&1; then
+            echo "MuseTalk health OK after ${i}s"
+            break
+        fi
+        sleep 1
+    done
+fi
 
 # Keep container running — attach to supervisord
 echo "All services ready. Entering supervisord loop."

@@ -2,6 +2,7 @@
 
 Stage 0: Hello-world connectivity verification.
 Stage 2: LLM + TTS conversational pipeline (streaming).
+Stage 4: Face animation with decoupled A/V streaming.
 """
 
 import asyncio
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import msgpack
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from starlette.requests import Request
 
 from src.llm.chunker import SentenceChunker
 from src.llm.client import ChatSession, LLMClient
@@ -25,12 +27,24 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-app = FastAPI(title="Avatar Server", version="0.4.0")
+app = FastAPI(title="Avatar Server", version="0.5.0")
 
 # Service clients — initialized once, reused across requests
 llm_client = LLMClient()
 tts_client = TTSClient()
 logger.info("Voice cloning disabled by default (upload refs via /voice/reference, enable via /voice/enable)")
+
+# Face animation (optional, gated by FACE_ENABLED env var)
+FACE_ENABLED = os.environ.get("FACE_ENABLED", "false").lower() == "true"
+face_client = None
+_active_avatar_id: str | None = None
+
+if FACE_ENABLED:
+    from src.face.client import FaceAnimationClient
+    face_client = FaceAnimationClient()
+    logger.info("Face animation ENABLED (FACE_BASE_URL=%s)", face_client.base_url)
+else:
+    logger.info("Face animation disabled (set FACE_ENABLED=true to enable)")
 
 # Shared references directory — Fish Speech reads from here at inference time.
 # Orchestrator runs from /app/orchestrator, TTS from /app.
@@ -52,12 +66,19 @@ async def health() -> dict[str, str]:
     """Health check endpoint with service status."""
     llm_ok = await llm_client.health_check()
     tts_ok = await tts_client.health_check()
-    return {
+    face_ok = False
+    if face_client is not None:
+        face_ok = await face_client.health_check()
+    result: dict[str, str] = {
         "status": "ok" if (llm_ok and tts_ok) else "degraded",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "llm": "ok" if llm_ok else "unavailable",
         "tts": "ok" if tts_ok else "unavailable",
     }
+    if FACE_ENABLED:
+        result["face"] = "ok" if face_ok else "unavailable"
+        result["face_avatar"] = _active_avatar_id or "none"
+    return result
 
 
 # ── Voice cloning endpoints ──────────────────────────────────────────
@@ -145,6 +166,71 @@ async def voice_status() -> dict:
         "enabled": tts_client.voice_enabled,
         "reference_id": tts_client.reference_id,
     }
+
+
+# ── Face Animation Endpoints ────────────────────────────────────────
+
+
+@app.post("/face/prepare")
+async def prepare_face(request: Request) -> dict:
+    """Upload a reference video for avatar preparation.
+
+    Expects multipart form: video file + optional avatar_id.
+    """
+    if not FACE_ENABLED or face_client is None:
+        return {"error": "Face animation is not enabled"}
+    form = await request.form()
+    video_file = form.get("video")
+    if video_file is None:
+        return {"error": "No video file provided"}
+    avatar_id = form.get("avatar_id")
+    if isinstance(avatar_id, str) and avatar_id.strip():
+        avatar_id = avatar_id.strip()
+    else:
+        avatar_id = None
+    video_bytes = await video_file.read()
+    result = await face_client.prepare_avatar(video_bytes, avatar_id)
+    return result
+
+
+@app.post("/face/enable")
+async def enable_face(avatar_id: str) -> dict:
+    """Enable face animation with the specified avatar."""
+    global _active_avatar_id
+    if not FACE_ENABLED or face_client is None:
+        return {"error": "Face animation is not enabled"}
+    avatars = await face_client.list_avatars()
+    if avatar_id not in avatars:
+        return {"error": f"Avatar '{avatar_id}' not found"}
+    _active_avatar_id = avatar_id
+    return {"enabled": True, "avatar_id": avatar_id}
+
+
+@app.post("/face/disable")
+async def disable_face() -> dict:
+    """Disable face animation."""
+    global _active_avatar_id
+    _active_avatar_id = None
+    return {"enabled": False, "avatar_id": None}
+
+
+@app.get("/face/status")
+async def face_status() -> dict:
+    """Get current face animation status."""
+    return {
+        "face_enabled": FACE_ENABLED,
+        "face_available": face_client is not None,
+        "active_avatar_id": _active_avatar_id,
+    }
+
+
+@app.get("/face/avatars")
+async def list_face_avatars() -> dict:
+    """List available avatar IDs."""
+    if not FACE_ENABLED or face_client is None:
+        return {"avatars": []}
+    avatars = await face_client.list_avatars()
+    return {"avatars": avatars}
 
 
 @app.websocket("/ws")
@@ -293,8 +379,24 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
     audio_chunk_count = 0
 
+    # Video pipeline: PCM chunks are forked here for MuseTalk processing
+    video_pcm_queue: asyncio.Queue[bytes | None] | None = None
+    face_session_id: str | None = None
+
+    if FACE_ENABLED and face_client is not None and _active_avatar_id is not None:
+        video_pcm_queue = asyncio.Queue()
+        try:
+            face_session_id = await face_client.start_session(_active_avatar_id)
+        except Exception:
+            logger.warning("Failed to start face session, continuing audio-only")
+            video_pcm_queue = None
+
     async def _tts_consumer() -> None:
-        """Sequentially process sentences from the queue with streaming TTS."""
+        """Sequentially process sentences from the queue with streaming TTS.
+
+        Sends chat_audio immediately. If face animation is active, forks
+        raw PCM to the video_pcm_queue for parallel processing.
+        """
         nonlocal audio_chunk_count
         while True:
             sentence = await sentence_queue.get()
@@ -303,6 +405,7 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
             try:
                 chunk_idx = 0
                 async for wav_chunk in tts_client.synthesize_streaming(sentence):
+                    # Send audio immediately (decoupled — never blocked by face)
                     await ws.send_bytes(msgpack.packb({
                         "type": "chat_audio",
                         "data": base64.b64encode(wav_chunk).decode("ascii"),
@@ -310,6 +413,12 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
                         "chat_id": chat_id,
                         "server_ts": time.time(),
                     }))
+
+                    # Fork raw PCM to video pipeline (strip 44-byte WAV header)
+                    if video_pcm_queue is not None and len(wav_chunk) > 44:
+                        raw_pcm = wav_chunk[44:]
+                        await video_pcm_queue.put(raw_pcm)
+
                     chunk_idx += 1
                 audio_chunk_count += chunk_idx
                 if chunk_idx == 0:
@@ -317,7 +426,84 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
             except Exception:
                 logger.exception("TTS streaming error for: '%s'", sentence[:50])
 
+        # Signal video pipeline that audio is done
+        if video_pcm_queue is not None:
+            await video_pcm_queue.put(None)
+
+    async def _video_producer() -> None:
+        """Consume PCM from video queue, feed to MuseTalk, send chat_video.
+
+        Runs in parallel with _tts_consumer. Batches ~200-400ms of PCM
+        before feeding MuseTalk for GPU efficiency.
+        """
+        if video_pcm_queue is None or face_session_id is None or face_client is None:
+            return
+
+        # Batch parameters: accumulate ~300ms of audio before feeding
+        # 44100Hz * 2 bytes/sample * 0.3s = 26460 bytes
+        batch_threshold = 26460
+        pcm_batch = bytearray()
+        frame_idx = 0
+
+        async def _feed_and_send_frames(pcm_data: bytes) -> None:
+            """Feed PCM to MuseTalk and send resulting JPEG frames."""
+            nonlocal frame_idx
+            try:
+                jpeg_frames = await face_client.feed_audio(face_session_id, pcm_data)
+                for jpeg_bytes in jpeg_frames:
+                    await ws.send_bytes(msgpack.packb({
+                        "type": "chat_video",
+                        "frame": base64.b64encode(jpeg_bytes).decode("ascii"),
+                        "frame_idx": frame_idx,
+                        "fps": 25,
+                        "chat_id": chat_id,
+                        "server_ts": time.time(),
+                    }))
+                    frame_idx += 1
+            except Exception:
+                logger.warning("Failed to feed audio to face service")
+
+        try:
+            while True:
+                pcm_chunk = await video_pcm_queue.get()
+                if pcm_chunk is None:
+                    # Flush remaining PCM
+                    if pcm_batch:
+                        await _feed_and_send_frames(bytes(pcm_batch))
+                    break
+
+                pcm_batch.extend(pcm_chunk)
+
+                # Feed when batch is large enough
+                if len(pcm_batch) >= batch_threshold:
+                    await _feed_and_send_frames(bytes(pcm_batch))
+                    pcm_batch.clear()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Video producer error")
+        finally:
+            # End face session to flush final frames + release GPU memory
+            try:
+                final_frames = await face_client.end_session(face_session_id)
+                for jpeg_bytes in final_frames:
+                    await ws.send_bytes(msgpack.packb({
+                        "type": "chat_video",
+                        "frame": base64.b64encode(jpeg_bytes).decode("ascii"),
+                        "frame_idx": frame_idx,
+                        "fps": 25,
+                        "chat_id": chat_id,
+                        "server_ts": time.time(),
+                    }))
+                    frame_idx += 1
+            except Exception:
+                logger.warning("Failed to end face session cleanly")
+
     consumer_task = asyncio.create_task(_tts_consumer())
+    video_task: asyncio.Task | None = None
+    if video_pcm_queue is not None:
+        video_task = asyncio.create_task(_video_producer())
 
     try:
         async for token in llm_client.stream_chat(session):
@@ -345,6 +531,10 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         await sentence_queue.put(None)
         await consumer_task
 
+        # Wait for video pipeline to finish (processes remaining audio)
+        if video_task is not None:
+            await video_task
+
         # Store assistant response in session history
         assistant_text = "".join(full_response)
         session.add_assistant_message(assistant_text)
@@ -362,8 +552,13 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     except asyncio.CancelledError:
         logger.info("Chat pipeline cancelled for %s [%s]", client_id, chat_id)
         consumer_task.cancel()
+        if video_task is not None:
+            video_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await consumer_task
+        if video_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await video_task
 
         # ── Fix conversation history after cancellation ──
         # add_user_message() was called before streaming started, so the
@@ -400,8 +595,13 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     except Exception:
         logger.exception("Chat pipeline error for %s", client_id)
         consumer_task.cancel()
+        if video_task is not None:
+            video_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await consumer_task
+        if video_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await video_task
         try:
             await ws.send_bytes(msgpack.packb({
                 "type": "error",
