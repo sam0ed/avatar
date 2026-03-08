@@ -361,8 +361,8 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         # Gemma 2 (and most chat models) produce 0 tokens.
         partial_text = "".join(full_response)
         if partial_text:
-            # Save whatever was generated before the cancel
-            session.add_assistant_message(partial_text)
+            # Save whatever was generated before the cancel, marked as interrupted
+            session.add_assistant_message(partial_text.rstrip() + " [interrupted]")
             logger.info(
                 "Saved partial response (%d chars) for %s [%s]",
                 len(partial_text), client_id, chat_id,
