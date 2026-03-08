@@ -67,6 +67,17 @@ fi
 # --- 3. Prepare directories ---
 mkdir -p /app/references /var/log/supervisor
 
+# --- 3.5. Ensure libcuda.so symlink for torch.compile/Triton ---
+# The runtime image has libcuda.so.1 (from NVIDIA container toolkit) but
+# Triton's gcc link step needs plain libcuda.so in the linker search path.
+if [ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so ]; then
+    if [ -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]; then
+        ln -s /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so
+    elif [ -e /usr/local/cuda/lib64/stubs/libcuda.so ]; then
+        ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
+    fi
+fi
+
 # --- 4. Start all services via supervisord ---
 echo ""
 echo "Starting services via supervisord ..."
