@@ -172,21 +172,32 @@ class VoiceClient:
         """Monitor for user speech during server response.
 
         Uses the pause/verify/resume pattern (LiveKit-style):
-            1. Wait for speech to start (Moonshine VAD).
-            2. Immediately PAUSE playback (not cancel).
-            3. Wait up to BARGE_IN_VERIFY_TIMEOUT for ASR to produce text.
+            1. Wait for audio playback to actually start (avoids false
+               triggers from the avatar's own speech coming through speakers).
+            2. Wait for speech to start (Moonshine VAD).
+            3. Immediately PAUSE playback (not cancel).
+            4. Wait up to BARGE_IN_VERIFY_TIMEOUT for ASR to produce text.
                - If text is a backchannel → RESUME playback, restart loop.
+               - If text has < MIN_BARGE_IN_WORDS → likely echo, RESUME.
                - If text is real speech → CANCEL playback, return text.
-               - If timeout (long speech) → CANCEL playback, await full line.
-
-        The user hears a brief pause (~0.3-0.5s) while we verify, then
-        either playback resumes seamlessly or it's cancelled for good.
+               - If timeout (long speech) → wait for full line, then check.
 
         Returns:
             Transcription text of the interrupting speech.
         """
+        # Don't start monitoring until audio is actually playing.
+        # This prevents the avatar's first TTS chunk (arriving before
+        # any speaker output) from being picked up as "user speech".
+        while not self._player.is_playing:
+            await asyncio.sleep(0.05)
+
         while True:
             await self._transcriber.wait_for_speech_start()
+
+            # If playback already finished while we waited, bail out.
+            if not self._player.is_playing:
+                text = await self._transcriber.get_next_line()
+                return text
 
             # Immediately pause — user hears silence while we verify.
             self._player.pause()
@@ -198,9 +209,10 @@ class VoiceClient:
                     timeout=BARGE_IN_VERIFY_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                # Speech still going after verify timeout — real interruption.
+                # Speech continued for 0.5s while speakers were paused/silent.
+                # This MUST be the user — echo would have stopped.
                 self._player.cancel()
-                logger.info("Barge-in: sustained speech, cancelling playback")
+                logger.info("Barge-in: sustained speech past timeout, cancelling")
                 text = await self._transcriber.get_next_line()
                 return text
 
