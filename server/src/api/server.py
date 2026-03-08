@@ -223,13 +223,18 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         logger.info("Client disconnected: %s", client_id)
         if chat_task is not None and not chat_task.done():
             chat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await chat_task
         _sessions.pop(client_id, None)
     except Exception:
         logger.exception("WebSocket error for %s", client_id)
         if chat_task is not None and not chat_task.done():
             chat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await chat_task
         _sessions.pop(client_id, None)
-        await ws.close(code=1011, reason="Internal server error")
+        with contextlib.suppress(Exception):
+            await ws.close(code=1011, reason="Internal server error")
 
 
 async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
@@ -348,6 +353,29 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         consumer_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await consumer_task
+
+        # ── Fix conversation history after cancellation ──
+        # add_user_message() was called before streaming started, so the
+        # session already contains the user turn.  Without an assistant
+        # reply the history has consecutive user messages, which makes
+        # Gemma 2 (and most chat models) produce 0 tokens.
+        partial_text = "".join(full_response)
+        if partial_text:
+            # Save whatever was generated before the cancel
+            session.add_assistant_message(partial_text)
+            logger.info(
+                "Saved partial response (%d chars) for %s [%s]",
+                len(partial_text), client_id, chat_id,
+            )
+        else:
+            # No tokens generated — roll back the user message
+            if session.messages and session.messages[-1].role == "user":
+                session.messages.pop()
+                logger.info(
+                    "Removed unanswered user message for %s [%s]",
+                    client_id, chat_id,
+                )
+
         try:
             await ws.send_bytes(msgpack.packb({
                 "type": "chat_cancelled",
@@ -360,8 +388,14 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     except Exception:
         logger.exception("Chat pipeline error for %s", client_id)
         consumer_task.cancel()
-        await ws.send_bytes(msgpack.packb({
-            "type": "error",
-            "message": "Chat pipeline error",
-            "server_ts": time.time(),
-        }))
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer_task
+        try:
+            await ws.send_bytes(msgpack.packb({
+                "type": "error",
+                "message": "Chat pipeline error",
+                "chat_id": chat_id,
+                "server_ts": time.time(),
+            }))
+        except Exception:
+            pass  # WebSocket may already be closed

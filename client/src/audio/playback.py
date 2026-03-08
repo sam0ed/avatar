@@ -20,12 +20,18 @@ class AudioPlayer:
 
     Plays WAV audio chunks from a queue through speakers.
     Supports cancel() for barge-in (stops playback immediately).
+
+    cancel() only sets a flag + wakes the queue reader.  The
+    sounddevice stream is only touched inside play_queue's own
+    control flow, so there is never a concurrent abort/write race.
     """
 
     def __init__(self) -> None:
         self._stream: sd.RawOutputStream | None = None
         self._cancelled = False
         self._playing = False
+        # Used to wake a blocked queue.get() when cancel() is called.
+        self._cancel_event: asyncio.Event = asyncio.Event()
 
     @property
     def is_playing(self) -> bool:
@@ -45,22 +51,30 @@ class AudioPlayer:
             Number of audio chunks played.
         """
         self._cancelled = False
+        self._cancel_event.clear()
         self._playing = True
         chunk_count = 0
         loop = asyncio.get_event_loop()
 
         try:
             while not self._cancelled:
-                try:
-                    audio_data = await asyncio.wait_for(queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
+                # Wait for audio data OR cancel — whichever comes first.
+                get_task = asyncio.ensure_future(queue.get())
+                cancel_wait = asyncio.ensure_future(self._cancel_event.wait())
+                done, _ = await asyncio.wait(
+                    [get_task, cancel_wait],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if cancel_wait in done:
+                    get_task.cancel()
+                    break
+
+                cancel_wait.cancel()
+                audio_data = get_task.result()
 
                 if audio_data is None:
-                    break
-
-                if self._cancelled:
-                    break
+                    break  # Normal end-of-stream sentinel
 
                 try:
                     with wave.open(io.BytesIO(audio_data), "rb") as wf:
@@ -73,14 +87,17 @@ class AudioPlayer:
                             self._stream.start()
                         pcm = wf.readframes(wf.getnframes())
 
-                    if not self._cancelled:
-                        # write() blocks until the device buffer has room.
-                        await loop.run_in_executor(None, self._stream.write, pcm)
-                        chunk_count += 1
+                    # write() blocks until the device buffer has room.
+                    await loop.run_in_executor(None, self._stream.write, pcm)
+                    if self._cancelled:
+                        break  # Cancel arrived while write() was blocking
+                    chunk_count += 1
+                except sd.PortAudioError:
+                    break  # Stream was invalidated — expected during cancel
                 except Exception as e:
-                    logger.warning("Audio playback failed: %s", e)
+                    logger.warning("Audio playback error: %s", e)
         finally:
-            self._drain_or_abort()
+            self._close_stream()
             self._playing = False
 
         return chunk_count
@@ -88,15 +105,16 @@ class AudioPlayer:
     def cancel(self) -> None:
         """Cancel current playback immediately (for barge-in).
 
-        Aborts the output stream (discards buffered audio) and sets
-        the cancelled flag so the play_queue loop exits.
+        Safe to call from any coroutine.  Only sets a flag and wakes the
+        queue reader — the stream is closed inside play_queue's finally
+        block so there is never a concurrent abort/write race.
         """
         self._cancelled = True
-        self._abort_stream()
+        self._cancel_event.set()
         logger.debug("Audio playback cancelled")
 
-    def _drain_or_abort(self) -> None:
-        """Stop the stream — drain if normal finish, abort if cancelled."""
+    def _close_stream(self) -> None:
+        """Close the output stream — abort if cancelled, drain if normal."""
         if self._stream is None:
             return
         try:
@@ -108,13 +126,3 @@ class AudioPlayer:
         except Exception:
             pass
         self._stream = None
-
-    def _abort_stream(self) -> None:
-        """Immediately abort the output stream (for cancel)."""
-        if self._stream is not None:
-            try:
-                self._stream.abort()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None

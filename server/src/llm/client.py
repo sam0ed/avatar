@@ -3,6 +3,7 @@
 Provides streaming chat completions with SSE parsing.
 """
 
+import json
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -55,12 +56,20 @@ class ChatSession:
 
         Gemma 2 (MamayLM) does not support the 'system' role, so the system
         prompt is prepended to the first user message instead.
+
+        Safety: consecutive messages with the same role are merged with a
+        newline separator.  This prevents malformed history (e.g. after a
+        cancelled response) from breaking the model.
         """
         result: list[dict[str, str]] = []
         for m in self.messages:
             if m.role == "system":
                 continue  # handled below
-            result.append({"role": m.role, "content": m.content})
+            # Merge consecutive same-role messages (defensive)
+            if result and result[-1]["role"] == m.role:
+                result[-1]["content"] += "\n" + m.content
+            else:
+                result.append({"role": m.role, "content": m.content})
 
         # Prepend system prompt to first user message
         if self.system_prompt and result:
@@ -106,6 +115,8 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.timeout = timeout
+        # Persistent connection pool — avoids TCP handshake per request
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
 
     async def health_check(self) -> bool:
         """Check if the LLM server is reachable.
@@ -114,12 +125,11 @@ class LLMClient:
             True if the server responds to /v1/models.
         """
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{self.base_url}/v1/models",
-                    timeout=10.0,
-                )
-                return resp.status_code == 200
+            resp = await self._http.get(
+                f"{self.base_url}/v1/models",
+                timeout=10.0,
+            )
+            return resp.status_code == 200
         except Exception as e:
             logger.error("LLM health check failed: %s", e)
             return False
@@ -148,36 +158,34 @@ class LLMClient:
             "top_p": self.top_p,
         }
 
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/v1/chat/completions",
-                json=payload,
-                timeout=self.timeout,
-            ) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    logger.error("LLM request failed (%d): %s", response.status_code, body[:500])
-                    return
+        async with self._http.stream(
+            "POST",
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=self.timeout,
+        ) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                raise RuntimeError(
+                    f"LLM request failed ({response.status_code}): {body[:500]}"
+                )
 
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
 
-                    data = line[6:]  # strip "data: " prefix
-                    if data.strip() == "[DONE]":
-                        break
+                data = line[6:]  # strip "data: " prefix
+                if data.strip() == "[DONE]":
+                    break
 
-                    try:
-                        import json
-
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
-                    except Exception as e:
-                        logger.warning("Failed to parse SSE chunk: %s — %s", data[:100], e)
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                except Exception as e:
+                    logger.warning("Failed to parse SSE chunk: %s — %s", data[:100], e)
 
     async def chat(self, session: ChatSession) -> str:
         """Non-streaming chat completion.

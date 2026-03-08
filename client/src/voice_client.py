@@ -184,12 +184,56 @@ class VoiceClient:
 
         return False
 
+    # ── Barge-in detection ──────────────────────────────────────
+    # Grace period (seconds) for speech to complete before treating
+    # it as a real interruption.  Short backchannels finish within
+    # this window and are silently ignored — zero audio disruption.
+    BARGE_IN_GRACE = 0.7
+
+    async def _barge_in_monitor(self) -> str:
+        """Monitor for user speech during server response (delayed-cancel).
+
+        Strategy:
+            1. Wait for speech to start (Moonshine VAD).
+            2. Give up to BARGE_IN_GRACE seconds for the line to complete.
+               - Completed + filtered (backchannel) → ignore, restart loop.
+               - Completed + real speech → cancel player, return text.
+               - Timeout (speech > 0.7 s) → cancel player, await full line.
+
+        Returns:
+            Transcription text of the interrupting speech.  Runs until
+            real speech is detected — cancel this task externally when
+            the server response ends normally.
+        """
+        while True:
+            await self._transcriber.wait_for_speech_start()
+
+            try:
+                text = await asyncio.wait_for(
+                    self._transcriber.get_next_line(),
+                    timeout=self.BARGE_IN_GRACE,
+                )
+            except asyncio.TimeoutError:
+                # Speech > BARGE_IN_GRACE — definitely a real interruption.
+                self._player.cancel()
+                text = await self._transcriber.get_next_line()
+                return text
+
+            # Short speech completed — apply pre-filters.
+            if self._should_filter_interruption(text):
+                continue  # zero disruption; keep listening
+
+            # Real speech that completed quickly.
+            self._player.cancel()
+            return text
+
     async def _process_chat(self, text: str) -> str | None:
         """Send text to server and handle streaming response with barge-in.
 
         Displays LLM tokens in real-time and plays audio as it arrives.
         The mic stays active — if the user starts speaking, playback and
-        the server pipeline are cancelled immediately.
+        the server pipeline are cancelled via the delayed-cancel barge-in
+        monitor.
 
         Args:
             text: Transcribed user speech to send.
@@ -219,64 +263,39 @@ class VoiceClient:
         first_audio_time: float | None = None
         token_count = 0
 
-        # Start background audio player
+        # Background audio player + barge-in monitor
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-        player_task = (
+        player_task: asyncio.Task[int] | None = (
             asyncio.create_task(self._player.play_queue(audio_queue))
             if self.play_audio
             else None
         )
+        barge_in_task: asyncio.Task[str] = asyncio.create_task(
+            self._barge_in_monitor()
+        )
 
-        # Start barge-in detector — waits for user speech in parallel
         barge_in_text: str | None = None
-        barge_in_task = asyncio.create_task(self._transcriber.get_next_line())
+        interrupted = False
 
         print("\n\033[1mAvatar:\033[0m ", end="", flush=True)
 
-        interrupted = False
-        while True:
-            try:
-                # Race: next server message vs. user speech (barge-in)
-                recv_task = asyncio.ensure_future(
-                    asyncio.wait_for(self._ws.recv(), timeout=120.0)
-                )
+        try:
+            while True:
+                recv_task = asyncio.ensure_future(self._ws.recv())
 
                 done, _ = await asyncio.wait(
                     [recv_task, barge_in_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                # ── Barge-in detected ──
-                if barge_in_task in done:
-                    recv_task.cancel()
-                    barge_in_text = barge_in_task.result()
-
-                    # Pre-filter: ignore backchannels, short/brief utterances
-                    if self._should_filter_interruption(barge_in_text):
-                        barge_in_task = asyncio.create_task(
-                            self._transcriber.get_next_line()
-                        )
-                        continue
-
-                    interrupted = True
-                    print(f"\n\033[90m[interrupted]\033[0m")
-                    logger.info("Barge-in detected: '%s'", barge_in_text)
-
-                    # 1) Stop audio playback immediately
-                    self._player.cancel()
-
-                    # 2) Tell server to cancel LLM + TTS pipeline
-                    if self._ws:
-                        cancel_msg = {"type": "chat_cancel", "chat_id": chat_id, "ts": time.time()}
-                        await self._ws.send(msgpack.packb(cancel_msg))
-
-                    # 3) Drain remaining server messages until chat_done/chat_cancelled
-                    await self._drain_server_response()
-                    break
-
-                # ── Normal server message ──
+                # ── Always process a completed recv first (avoid message loss) ──
                 if recv_task in done:
-                    raw = recv_task.result()
+                    try:
+                        raw = recv_task.result()
+                    except websockets.ConnectionClosed:
+                        logger.warning("Connection closed during chat")
+                        break
+
                     response = msgpack.unpackb(raw, raw=False)
 
                     # Ignore stale messages from previous chat requests
@@ -286,7 +305,9 @@ class VoiceClient:
                             "Ignoring stale message (type=%s, chat_id=%s, expected=%s)",
                             response.get("type"), msg_chat_id, chat_id,
                         )
-                        continue
+                        # Fall through to barge-in check if it also completed
+                        if barge_in_task not in done:
+                            continue
 
                     msg_type = response.get("type", "")
 
@@ -314,41 +335,75 @@ class VoiceClient:
                         break
 
                     elif msg_type == "error":
-                        print(f"\n\033[31mError: {response.get('message', 'Unknown error')}\033[0m")
+                        err = response.get("message", "Unknown error")
+                        print(f"\n\033[31mError: {err}\033[0m")
                         break
 
-            except asyncio.TimeoutError:
-                print("\n\033[31mTimeout waiting for response\033[0m")
-                break
+                # ── Barge-in detected ──
+                if barge_in_task in done:
+                    if recv_task not in done:
+                        recv_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await recv_task
 
-        elapsed = time.perf_counter() - start_time
+                    barge_in_text = barge_in_task.result()
+                    interrupted = True
+                    print(f"\n\033[90m[interrupted]\033[0m")
+                    logger.info("Barge-in detected: '%s'", barge_in_text)
 
-        # Print timing stats
-        stats: list[str] = [f"Total: {elapsed:.1f}s"]
-        if first_token_time is not None:
-            stats.append(f"First token: {first_token_time - start_time:.2f}s")
-        if first_audio_time is not None:
-            stats.append(f"First audio: {first_audio_time - start_time:.2f}s")
-        stats.append(f"Tokens: {token_count}")
-        if interrupted:
-            stats.append("INTERRUPTED")
-        print(f"\033[90m[{' | '.join(stats)}]\033[0m")
+                    # Tell server to cancel LLM + TTS pipeline
+                    try:
+                        cancel_msg = {
+                            "type": "chat_cancel",
+                            "chat_id": chat_id,
+                            "ts": time.time(),
+                        }
+                        await self._ws.send(msgpack.packb(cancel_msg))
+                    except websockets.ConnectionClosed:
+                        pass  # Server already gone
 
-        # Clean up audio player
-        if player_task:
+                    await self._drain_server_response()
+                    break
+
+        except websockets.ConnectionClosed:
+            logger.warning("WebSocket connection closed during chat")
+
+        finally:
+            elapsed = time.perf_counter() - start_time
+
+            # ── Timing stats ──
+            stats: list[str] = [f"Total: {elapsed:.1f}s"]
+            if first_token_time is not None:
+                stats.append(f"First token: {first_token_time - start_time:.2f}s")
+            if first_audio_time is not None:
+                stats.append(f"First audio: {first_audio_time - start_time:.2f}s")
+            stats.append(f"Tokens: {token_count}")
             if interrupted:
-                # Player was already cancelled, just await to collect
+                stats.append("INTERRUPTED")
+            print(f"\033[90m[{' | '.join(stats)}]\033[0m")
+
+            # ── Clean up audio player ──
+            if player_task is not None:
+                if player_task.done():
+                    pass  # already finished
+                elif interrupted:
+                    pass  # _barge_in_monitor already called cancel()
+                else:
+                    await audio_queue.put(None)  # sentinel for normal end
                 with contextlib.suppress(Exception):
                     await player_task
-            else:
-                await audio_queue.put(None)  # sentinel
-                await player_task
 
-        # Clean up barge-in task if response finished without interruption
-        if not barge_in_task.done():
-            barge_in_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await barge_in_task
+            # ── Clean up barge-in monitor ──
+            if not barge_in_task.done():
+                barge_in_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await barge_in_task
+            elif not interrupted:
+                # Monitor completed (speech detected) while server also
+                # finished — capture the text so it isn't silently lost.
+                late_text = barge_in_task.result()
+                if late_text:
+                    barge_in_text = late_text
 
         return barge_in_text
 
@@ -367,8 +422,12 @@ class VoiceClient:
                 msg_type = response.get("type", "")
                 if msg_type in ("chat_done", "chat_cancelled"):
                     break
-        except (asyncio.TimeoutError, Exception):
-            pass  # Server may have already finished
+        except asyncio.TimeoutError:
+            logger.warning("Drain timeout — server may have already finished")
+        except websockets.ConnectionClosed:
+            logger.debug("Connection closed during drain")
+        except Exception:
+            logger.exception("Unexpected error during drain")
 
     async def _wait_for_complete_turn(self, initial_text: str) -> str:
         """Accumulate speech segments until Smart Turn says turn is complete.
@@ -495,6 +554,8 @@ class VoiceClient:
 
         except KeyboardInterrupt:
             print("\n")
+        except Exception:
+            logger.exception("Voice client error")
         finally:
             self._running = False
             quit_task.cancel()

@@ -10,6 +10,8 @@ future sharing of the audio stream with other components.
 
 import asyncio
 import logging
+import queue
+import threading
 import time
 from typing import Any
 
@@ -74,6 +76,9 @@ class SpeechTranscriber:
         # Raw audio ring buffer (for Smart Turn analysis)
         self._audio_buffer: list[np.ndarray] = []
         self._max_buffer_chunks = int(10 * SAMPLE_RATE / BLOCK_SIZE)  # 10 seconds
+        # Thread-safe queue for decoupling audio callback from processing
+        self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
+        self._worker_thread: threading.Thread | None = None
 
     async def initialize(self) -> None:
         """Download model and create transcriber.
@@ -110,13 +115,20 @@ class SpeechTranscriber:
     def start(self) -> None:
         """Start capturing audio and transcribing.
 
-        Creates the sounddevice InputStream and starts the Moonshine session.
+        Creates the sounddevice InputStream, starts the Moonshine session,
+        and launches a worker thread that feeds audio to Moonshine.
         """
         if not self._transcriber:
             raise RuntimeError("Call initialize() first")
 
         self._transcriber.start()
         self._listening = True
+
+        # Worker thread processes audio off the callback thread
+        self._worker_thread = threading.Thread(
+            target=self._audio_worker, daemon=True, name="asr-worker",
+        )
+        self._worker_thread.start()
 
         self._sd_stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -141,6 +153,12 @@ class SpeechTranscriber:
             self._sd_stream.stop()
             self._sd_stream.close()
             self._sd_stream = None
+
+        # Signal worker thread to exit and wait for it
+        self._audio_queue.put(None)
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=2.0)
+            self._worker_thread = None
 
         if self._transcriber is not None:
             self._transcriber.stop()
@@ -224,11 +242,10 @@ class SpeechTranscriber:
         time_info: Any,
         status: sd.CallbackFlags,
     ) -> None:
-        """sounddevice callback — feeds audio to Moonshine transcriber.
+        """sounddevice callback — enqueues raw audio for the worker thread.
 
-        Called from the audio thread. add_audio() is designed to buffer
-        data quickly and return, so this is safe to call from the callback.
-        Also buffers raw audio for Smart Turn analysis.
+        Must be extremely fast to avoid input overflow. All processing
+        (Moonshine add_audio, ring buffer) happens in _audio_worker.
         """
         if status:
             logger.warning("Audio input status: %s", status)
@@ -236,22 +253,43 @@ class SpeechTranscriber:
         if not self._listening or self._transcriber is None:
             return
 
-        # indata shape: (frames, channels), dtype float32
-        # Moonshine expects a list of floats, mono PCM [-1.0, 1.0]
-        mono = indata[:, 0]
-        audio_chunk = mono.tolist()
-        self._transcriber.add_audio(audio_chunk, SAMPLE_RATE)
+        # Minimal work: copy and enqueue
+        self._audio_queue.put_nowait(indata[:, 0].copy())
 
-        # Buffer raw audio for Smart Turn analysis (ring buffer)
-        self._audio_buffer.append(mono.copy())
-        if len(self._audio_buffer) > self._max_buffer_chunks:
-            self._audio_buffer = self._audio_buffer[-self._max_buffer_chunks:]
+    def _audio_worker(self) -> None:
+        """Worker thread — feeds audio to Moonshine and manages ring buffer.
+
+        Runs in a separate thread so the sounddevice callback returns
+        instantly and never causes input overflow.
+        """
+        while True:
+            chunk = self._audio_queue.get()
+            if chunk is None:
+                break  # Shutdown signal
+
+            if not self._listening or self._transcriber is None:
+                continue
+
+            try:
+                # Feed to Moonshine (may trigger inference internally)
+                self._transcriber.add_audio(chunk.tolist(), SAMPLE_RATE)
+            except Exception:
+                logger.exception("Moonshine add_audio error (worker continues)")
+                continue
+
+            # Ring buffer for Smart Turn analysis
+            self._audio_buffer.append(chunk)
+            if len(self._audio_buffer) > self._max_buffer_chunks:
+                self._audio_buffer = self._audio_buffer[-self._max_buffer_chunks:]
 
     def _on_line_started(self, text: str) -> None:
         """Called from Moonshine thread when a new speech segment starts."""
         self._speech_start_time = time.monotonic()
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._speech_started_event.set)
+            try:
+                self._loop.call_soon_threadsafe(self._speech_started_event.set)
+            except RuntimeError:
+                pass  # Event loop already closed during shutdown
 
     def _on_line_text_changed(self, text: str) -> None:
         """Called from Moonshine thread when line text is updated."""
@@ -267,13 +305,24 @@ class SpeechTranscriber:
             return
         logger.info("Speech line completed: '%s' (%.2fs)", text, self._last_speech_duration)
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._line_queue.put_nowait, text)
+            try:
+                self._loop.call_soon_threadsafe(self._line_queue.put_nowait, text)
+            except RuntimeError:
+                pass  # Event loop already closed during shutdown
 
     def close(self) -> None:
-        """Release all resources."""
+        """Release all resources.
+
+        Explicitly closes the Moonshine transcriber to avoid the native
+        access-violation crash that occurs when __del__ double-frees.
+        """
         self.stop()
         if self._transcriber is not None:
             self._transcriber.remove_all_listeners()
+            try:
+                self._transcriber.close()
+            except Exception:
+                pass  # Suppress native double-free / access violation
             self._transcriber = None
 
 
