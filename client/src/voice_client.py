@@ -53,8 +53,8 @@ BACKCHANNEL_PATTERN = re.compile(
     r"^(mm-?hm|mhm|uh-?huh|yeah|yep|okay|ok|sure|right|hm+|oh|ah|got it|i see)\.?$",
     re.IGNORECASE,
 )
-MIN_INTERRUPTION_WORDS = 2
-MIN_INTERRUPTION_DURATION = 0.5  # seconds
+# How long to wait after pausing playback for ASR to confirm real speech.
+BARGE_IN_VERIFY_TIMEOUT = 0.5  # seconds
 
 
 def _is_backchannel(text: str) -> bool:
@@ -159,71 +159,58 @@ class VoiceClient:
             logger.warning("Smart Turn init failed: %s. Continuing without it.", e)
             return True
 
-    def _should_filter_interruption(self, text: str) -> bool:
-        """Check if a potential barge-in should be filtered out.
-
-        Returns True for backchannels, very short utterances, or
-        brief speech that doesn't warrant interrupting the avatar.
-        """
-        # Backchannel detection (e.g., "mhm", "yeah", "okay")
+    def _is_backchannel_only(self, text: str) -> bool:
+        """Check if text is a backchannel that should never interrupt."""
         if _is_backchannel(text):
             logger.info("Filtered backchannel: '%s'", text)
             return True
-
-        # Minimum word count
-        words = text.split()
-        if len(words) < MIN_INTERRUPTION_WORDS:
-            logger.info("Filtered short interruption (%d words): '%s'", len(words), text)
-            return True
-
-        # Minimum speech duration
-        duration = self._transcriber.last_speech_duration
-        if 0 < duration < MIN_INTERRUPTION_DURATION:
-            logger.info("Filtered brief speech (%.2fs): '%s'", duration, text)
-            return True
-
         return False
 
-    # ── Barge-in detection ──────────────────────────────────────
-    # Grace period (seconds) for speech to complete before treating
-    # it as a real interruption.  Short backchannels finish within
-    # this window and are silently ignored — zero audio disruption.
-    BARGE_IN_GRACE = 0.7
+    # ── Barge-in detection (pause/verify/resume pattern) ────────
 
     async def _barge_in_monitor(self) -> str:
-        """Monitor for user speech during server response (delayed-cancel).
+        """Monitor for user speech during server response.
 
-        Strategy:
+        Uses the pause/verify/resume pattern (LiveKit-style):
             1. Wait for speech to start (Moonshine VAD).
-            2. Give up to BARGE_IN_GRACE seconds for the line to complete.
-               - Completed + filtered (backchannel) → ignore, restart loop.
-               - Completed + real speech → cancel player, return text.
-               - Timeout (speech > 0.7 s) → cancel player, await full line.
+            2. Immediately PAUSE playback (not cancel).
+            3. Wait up to BARGE_IN_VERIFY_TIMEOUT for ASR to produce text.
+               - If text is a backchannel → RESUME playback, restart loop.
+               - If text is real speech → CANCEL playback, return text.
+               - If timeout (long speech) → CANCEL playback, await full line.
+
+        The user hears a brief pause (~0.3-0.5s) while we verify, then
+        either playback resumes seamlessly or it's cancelled for good.
 
         Returns:
-            Transcription text of the interrupting speech.  Runs until
-            real speech is detected — cancel this task externally when
-            the server response ends normally.
+            Transcription text of the interrupting speech.
         """
         while True:
             await self._transcriber.wait_for_speech_start()
 
+            # Immediately pause — user hears silence while we verify.
+            self._player.pause()
+            logger.debug("Barge-in: speech detected, playback paused")
+
             try:
                 text = await asyncio.wait_for(
                     self._transcriber.get_next_line(),
-                    timeout=self.BARGE_IN_GRACE,
+                    timeout=BARGE_IN_VERIFY_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                # Speech > BARGE_IN_GRACE — definitely a real interruption.
+                # Speech still going after verify timeout — real interruption.
                 self._player.cancel()
+                logger.info("Barge-in: sustained speech, cancelling playback")
                 text = await self._transcriber.get_next_line()
                 return text
 
-            # Short speech completed — apply pre-filters.
-            if self._should_filter_interruption(text):
-                continue  # zero disruption; keep listening
+            # ASR produced a line — check if it's just a backchannel.
+            if self._is_backchannel_only(text):
+                self._player.resume()
+                logger.debug("Barge-in: backchannel, resuming playback")
+                continue
 
-            # Real speech that completed quickly.
+            # Real speech — fully cancel.
             self._player.cancel()
             return text
 
