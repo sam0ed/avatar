@@ -127,6 +127,19 @@ avatar/
 - Client: `client/src/chat_client.py` — multi-turn terminal chat with real-time token display + audio playback
 - Logs: `ssh -p <port> root@<host> 'supervisorctl status'` or `'tail -f /var/log/supervisor/*.log'`
 
+### Stage 4 (Face Animation — MuseTalk 1.5)
+- Image: `ghcr.io/sam0ed/avatar-stage4:latest`, built by GitHub Actions from `docker/Dockerfile.stage4`
+- Deploy: `HF_TOKEN=hf_xxx uv run scripts/deploy_face.py` (FACE_ENABLED=true, 120GB disk, ports 8000/8001/8002/8080)
+- The image bakes system deps, the LLM venv and the MuseTalk checkout + venv. Model weights are **not** baked —
+  they download at first boot (~16GB) and `hf_transfer`/`hf_xet` make those parallel.
+- GitHub Actions is free and unlimited for public repos on standard runners; the workflow reclaims ~25GB of
+  runner disk first because the image is ~12GB. `ghcr.io` is free for public packages and has no anonymous pull
+  rate limit, unlike Docker Hub — which matters because Vast.ai pulls anonymously.
+- **The GHCR package must be set to Public once**, after the first successful build. Packages default to private
+  and Vast.ai has no registry credentials, so the pull fails with a 401 until this is done.
+- Setup: `uv run scripts/setup_face.py --video <reference.mp4> --url http://<ip>:8000`
+- Client: `cd client && uv run python src/face_voice_client.py ws://<ip>:8000/ws`
+
 ## Current Stage
 
 **Stage 4: Face Animation (MuseTalk 1.5)** — REWRITTEN, NOT YET RUN

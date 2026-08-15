@@ -1,0 +1,43 @@
+FROM fishaudio/fish-speech:server-cuda
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+
+RUN apt-get update -qq \
+    && apt-get install -y -qq supervisor git curl software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get install -y -qq python3.11 python3.11-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.11 -m venv /opt/llm-venv \
+    && /opt/llm-venv/bin/pip install --no-cache-dir \
+        'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1' hf_transfer hf_xet \
+        --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
+        --extra-index-url https://pypi.org/simple
+
+RUN git clone --depth 1 https://github.com/TMElyralab/MuseTalk.git /opt/musetalk
+
+RUN python3.11 -m venv /opt/musetalk-venv \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir \
+        torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+        --index-url https://download.pytorch.org/whl/cu118 \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir -r /opt/musetalk/requirements.txt \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir -U openmim \
+    && /opt/musetalk-venv/bin/mim install "mmengine" \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir "mmcv==2.0.1" --only-binary mmcv \
+        -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir numpy==1.23.5 opencv-python==4.9.0.80 \
+    && /opt/musetalk-venv/bin/mim install "mmdet==3.1.0" \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir "matplotlib==3.7.5" \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir "mmpose==1.1.0" --no-build-isolation \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir numpy==1.23.5 opencv-python==4.9.0.80 \
+    && /opt/musetalk-venv/bin/pip install --no-cache-dir \
+        fastapi uvicorn python-multipart hf_transfer hf_xet
+
+RUN /opt/musetalk-venv/bin/python -c "import numpy, cv2; print('numpy', numpy.__version__, 'cv2', cv2.__version__)" \
+    && /opt/musetalk-venv/bin/python -c "import mmcv; print('mmcv', mmcv.__version__)" \
+    && /opt/musetalk-venv/bin/python -c "import mmpose; print('mmpose', mmpose.__version__)" \
+    && /opt/musetalk-venv/bin/python -c "from diffusers import AutoencoderKL; print('diffusers OK')"
+
+RUN mkdir -p /app/references /app/avatars /var/log/supervisor /models

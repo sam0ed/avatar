@@ -6,10 +6,10 @@
 Same approach as deploy_stage2.py but with FACE_ENABLED=true, port 8002
 for MuseTalk, and extra disk for face models (~7GB) + venv (~3GB).
 
-Uses the off-the-shelf fishaudio/fish-speech:server-cuda image.
-The onstart-cmd git-clones the public repo, installs supervisor +
-llama-cpp-python, copies configs/code, then runs the entrypoint
-(model download + supervisord start).  No custom Docker image needed.
+Uses ghcr.io/sam0ed/avatar-stage4, built by GitHub Actions from
+docker/Dockerfile.stage4.  The image bakes system deps, the LLM venv and
+the MuseTalk checkout + venv, so the onstart-cmd only clones the repo,
+copies configs/code and runs the entrypoint (model download + supervisord).
 
 Usage:
     HF_TOKEN=hf_xxx uv run scripts/deploy_face.py
@@ -17,10 +17,10 @@ Usage:
 
 Notes:
     - Repo must be public on GitHub (code is cloned at boot).
-    - First boot installs deps (~5 min) + downloads ~16GB of model weights
-      (LLM ~5.8GB + TTS ~3.6GB + MuseTalk ~7GB).
+    - First boot pulls the image then downloads ~16GB of model weights
+      (LLM ~5.8GB + TTS ~3.6GB + MuseTalk ~4GB).  Weights are not baked in;
+      hf_transfer/hf_xet make those downloads parallel.
     - HF_TOKEN required for gated TTS model (env var or .env file).
-    - Python 3.11 installed via deadsnakes PPA (CUDA wheels only exist for cp310/cp311).
     - Ports: 8000 (WebSocket), 8001 (LLM API), 8080 (TTS API), 8002 (MuseTalk).
     - GPU budget: LLM ~5.5GB + TTS ~5GB + MuseTalk ~2GB = ~12.5GB / 24GB.
 """
@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-IMAGE = "fishaudio/fish-speech:server-cuda"
+IMAGE = "ghcr.io/sam0ed/avatar-stage4:latest"
 GITHUB_REPO = "https://github.com/sam0ed/avatar.git"
 DISK = "120"  # Extra for MuseTalk models + venv
 BLOCKED_REGIONS = {"CN", "RU"}
@@ -56,12 +56,10 @@ def build_onstart_cmd() -> str:
     """Build the onstart command that sets up the container at boot.
 
     Steps:
-        1. Install supervisor + git via apt.
-        2. Create isolated venv for LLM server, install llama-cpp-python.
-        3. Git clone the public repo (shallow, saves time).
-        4. Copy configs (supervisord, entrypoint) and orchestrator code.
-        5. Install orchestrator Python deps via uv.
-        6. Run entrypoint (downloads models, starts supervisord).
+        1. Git clone the public repo (shallow, saves time).
+        2. Copy configs (supervisord, entrypoint) and orchestrator code.
+        3. Install orchestrator Python deps via uv.
+        4. Run entrypoint (downloads models, starts supervisord).
 
     Returns:
         Shell command string (well under Vast.ai 4048 limit).
@@ -69,29 +67,18 @@ def build_onstart_cmd() -> str:
     steps = [
         # 0. Fix SSH permissions (Vast.ai creates authorized_keys with wrong modes)
         "chmod 700 /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; true",
-        # 1. System deps + Python 3.11 (CUDA wheels only exist for cp310/cp311)
-        "apt-get update -qq"
-        " && apt-get install -y -qq supervisor git software-properties-common"
-        " && add-apt-repository -y ppa:deadsnakes/ppa"
-        " && apt-get install -y -qq python3.11 python3.11-venv",
-        # 2. LLM venv + deps (pre-built CUDA 12.4 wheel for Python 3.11)
-        "python3.11 -m venv /opt/llm-venv"
-        " && /opt/llm-venv/bin/pip install"
-        " 'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1' hf_transfer"
-        " --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"
-        " --extra-index-url https://pypi.org/simple",
-        # 3. Clone repo
+        # 1. Clone repo (system deps, both venvs and MuseTalk are baked into the image)
         f"git clone --depth 1 {GITHUB_REPO} /tmp/av",
-        # 4. Copy configs + code
+        # 2. Copy configs + code
         "cp /tmp/av/docker/supervisord.conf /etc/supervisor/conf.d/avatar.conf"
         " && cp /tmp/av/docker/entrypoint_stage2.sh /app/"
         " && chmod +x /app/entrypoint_stage2.sh"
         " && mkdir -p /app/orchestrator"
         " && cp -r /tmp/av/server/src /app/orchestrator/"
         " && cp /tmp/av/server/pyproject.toml /app/orchestrator/",
-        # 5. Install orchestrator deps
+        # 3. Install orchestrator deps
         "cd /app/orchestrator && uv lock && uv sync --no-dev",
-        # 6. Run entrypoint (model download + supervisord)
+        # 4. Run entrypoint (model download + supervisord)
         "cd /app && bash /app/entrypoint_stage2.sh",
     ]
     return " && ".join(steps)
