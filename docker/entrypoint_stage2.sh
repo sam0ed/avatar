@@ -67,6 +67,8 @@ fi
 # --- 3. MuseTalk venv + models ---
 export FACE_ENABLED="${FACE_ENABLED:-false}"
 if [ "$FACE_ENABLED" = "true" ]; then
+    set +e
+
     MUSETALK_DIR="/opt/musetalk"
     MUSETALK_VENV="/opt/musetalk-venv"
 
@@ -82,42 +84,55 @@ if [ "$FACE_ENABLED" = "true" ]; then
         echo "[3b] Creating MuseTalk venv + installing deps ..."
         python3.11 -m venv "$MUSETALK_VENV"
         "$MUSETALK_VENV/bin/pip" install --upgrade pip
-        "$MUSETALK_VENV/bin/pip" install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+        "$MUSETALK_VENV/bin/pip" install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+            --index-url https://download.pytorch.org/whl/cu118
         "$MUSETALK_VENV/bin/pip" install -r "$MUSETALK_DIR/requirements.txt"
-        "$MUSETALK_VENV/bin/pip" install openmim
-        "$MUSETALK_VENV/bin/mim" install mmengine "mmcv==2.0.1" "mmdet==3.1.0" "mmpose==1.1.0"
-        "$MUSETALK_VENV/bin/pip" install fastapi uvicorn python-multipart opencv-python-headless librosa openai-whisper
+        "$MUSETALK_VENV/bin/pip" install --no-cache-dir -U openmim
+        "$MUSETALK_VENV/bin/mim" install "mmengine"
+        "$MUSETALK_VENV/bin/pip" install "mmcv==2.0.1" \
+            -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html
+        "$MUSETALK_VENV/bin/python" -c "import mmcv, mmcv.ops; print('mmcv', mmcv.__version__, 'ops OK')" \
+            || echo "[3b] ERROR: mmcv has no compiled ops; face animation will not work"
+        "$MUSETALK_VENV/bin/mim" install "mmdet==3.1.0"
+        "$MUSETALK_VENV/bin/mim" install "mmpose==1.1.0"
+        "$MUSETALK_VENV/bin/pip" install fastapi uvicorn python-multipart
     else
         echo "[3b] MuseTalk venv already exists at $MUSETALK_VENV"
     fi
 
-    # Download MuseTalk models
-    MUSETALK_CKPT="$MUSETALK_DIR/models/musetalk/musetalk.json"
-    if [ ! -f "$MUSETALK_CKPT" ]; then
+    if [ ! -f "$MUSETALK_DIR/models/musetalkV15/unet.pth" ]; then
         echo "[3c] Downloading MuseTalk models ..."
-        "$MUSETALK_VENV/bin/python" -c "
+        mkdir -p "$MUSETALK_DIR/models/face-parse-bisent"
+        "$MUSETALK_VENV/bin/python" - <<PY
 from huggingface_hub import snapshot_download
-import os
-# MuseTalk weights (v1.0 + v1.5)
-snapshot_download('TMElyralab/MuseTalk', local_dir='$MUSETALK_DIR/models/musetalk')
-# SD-VAE
-snapshot_download('stabilityai/sd-vae-ft-mse', local_dir='$MUSETALK_DIR/models/sd-vae-ft-mse')
-# DWPose
-snapshot_download('yzd-v/DWPose', local_dir='$MUSETALK_DIR/models/dwpose', allow_patterns=['*.pth'])
-# Face parsing
-snapshot_download('musetalk/face-parse-bisenet', local_dir='$MUSETALK_DIR/models/face-parse-bisenet')
-print('MuseTalk model download complete.')
-"
+
+root = "$MUSETALK_DIR/models"
+snapshot_download("TMElyralab/MuseTalk", local_dir=root,
+                  allow_patterns=["musetalkV15/unet.pth", "musetalkV15/musetalk.json"])
+snapshot_download("stabilityai/sd-vae-ft-mse", local_dir=f"{root}/sd-vae",
+                  allow_patterns=["config.json", "diffusion_pytorch_model.bin"])
+snapshot_download("openai/whisper-tiny", local_dir=f"{root}/whisper",
+                  allow_patterns=["config.json", "pytorch_model.bin", "preprocessor_config.json"])
+snapshot_download("yzd-v/DWPose", local_dir=f"{root}/dwpose",
+                  allow_patterns=["dw-ll_ucoco_384.pth"])
+print("HuggingFace weights downloaded.")
+PY
+        "$MUSETALK_VENV/bin/gdown" 154JgKpzCPW82qINcVieuPH3fZ2e0P812 \
+            -O "$MUSETALK_DIR/models/face-parse-bisent/79999_iter.pth"
+        curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
+            -o "$MUSETALK_DIR/models/face-parse-bisent/resnet18-5c106cde.pth"
+        echo "[3c] MuseTalk model download complete"
     else
         echo "[3c] MuseTalk models already cached"
     fi
 
-    # Copy face_server.py from orchestrator repo
-    cp /app/orchestrator/src/face/face_server.py "$MUSETALK_DIR/face_server.py"
+    cp /app/orchestrator/src/face/face_server.py "$MUSETALK_DIR/"
+    cp /app/orchestrator/src/face/musetalk_*.py "$MUSETALK_DIR/"
     echo "[3d] MuseTalk setup complete"
 else
     echo "[3] FACE_ENABLED=false, skipping MuseTalk setup"
 fi
+set -e
 
 # --- 4. Prepare directories ---
 mkdir -p /app/references /app/avatars /var/log/supervisor

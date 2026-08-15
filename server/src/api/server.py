@@ -183,14 +183,14 @@ async def prepare_face(request: Request) -> dict:
     video_file = form.get("video")
     if video_file is None:
         return {"error": "No video file provided"}
-    avatar_id = form.get("avatar_id")
-    if isinstance(avatar_id, str) and avatar_id.strip():
-        avatar_id = avatar_id.strip()
+    raw_avatar_id = form.get("avatar_id")
+    if isinstance(raw_avatar_id, str) and raw_avatar_id.strip():
+        avatar_id = raw_avatar_id.strip()
     else:
-        avatar_id = None
+        avatar_id = "default"
     video_bytes = await video_file.read()
-    result = await face_client.prepare_avatar(video_bytes, avatar_id)
-    return result
+    filename = getattr(video_file, "filename", None) or "reference.mp4"
+    return await face_client.prepare_avatar(video_bytes, avatar_id, filename)
 
 
 @app.post("/face/enable")
@@ -199,9 +199,12 @@ async def enable_face(avatar_id: str) -> dict:
     global _active_avatar_id
     if not FACE_ENABLED or face_client is None:
         return {"error": "Face animation is not enabled"}
-    avatars = await face_client.list_avatars()
-    if avatar_id not in avatars:
-        return {"error": f"Avatar '{avatar_id}' not found"}
+    available = (await face_client.list_avatars()).get("avatars", {})
+    if avatar_id not in available:
+        return {
+            "error": f"Avatar '{avatar_id}' not found",
+            "available": sorted(available),
+        }
     _active_avatar_id = avatar_id
     return {"enabled": True, "avatar_id": avatar_id}
 
@@ -228,9 +231,8 @@ async def face_status() -> dict:
 async def list_face_avatars() -> dict:
     """List available avatar IDs."""
     if not FACE_ENABLED or face_client is None:
-        return {"avatars": []}
-    avatars = await face_client.list_avatars()
-    return {"avatars": avatars}
+        return {"avatars": {}}
+    return await face_client.list_avatars()
 
 
 @app.websocket("/ws")
@@ -244,6 +246,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
       - echo → echo_reply (connectivity test)
       - chat → streams back: chat_token, chat_audio, chat_done
       - chat_cancel → cancels ongoing chat, sends chat_cancelled
+      - face_idle_frames → returns reference frames for client-side idle loop
     """
     await ws.accept()
     client_id = _get_client_id(ws)
@@ -296,6 +299,18 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         "type": "chat_cancelled",
                         "server_ts": time.time(),
                     }))
+
+            elif msg_type == "face_idle_frames":
+                frames: list[bytes] = []
+                if FACE_ENABLED and face_client is not None and _active_avatar_id is not None:
+                    with contextlib.suppress(Exception):
+                        frames = await face_client.get_idle_frames(_active_avatar_id)
+                await ws.send_bytes(msgpack.packb({
+                    "type": "face_idle_frames",
+                    "frames": frames,
+                    "fps": 5,
+                    "server_ts": time.time(),
+                }))
 
             else:
                 response = {
@@ -453,7 +468,7 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
                 for jpeg_bytes in jpeg_frames:
                     await ws.send_bytes(msgpack.packb({
                         "type": "chat_video",
-                        "frame": base64.b64encode(jpeg_bytes).decode("ascii"),
+                        "frame": jpeg_bytes,
                         "frame_idx": frame_idx,
                         "fps": 25,
                         "chat_id": chat_id,
@@ -490,7 +505,7 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
                 for jpeg_bytes in final_frames:
                     await ws.send_bytes(msgpack.packb({
                         "type": "chat_video",
-                        "frame": base64.b64encode(jpeg_bytes).decode("ascii"),
+                        "frame": jpeg_bytes,
                         "frame_idx": frame_idx,
                         "fps": 25,
                         "chat_id": chat_id,

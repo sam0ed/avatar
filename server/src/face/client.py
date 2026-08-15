@@ -28,15 +28,20 @@ class FaceAnimationClient:
         self,
         base_url: str = FACE_BASE_URL,
         timeout: float = 60.0,
+        prepare_timeout: float = 1800.0,
     ) -> None:
         """Initialize face animation client.
 
         Args:
             base_url: MuseTalk service base URL.
-            timeout: Request timeout in seconds.
+            timeout: Per-request timeout for streaming calls, in seconds.
+            prepare_timeout: Timeout for avatar preparation, which runs face
+                detection and VAE encoding over every frame of the reference
+                video and can take many minutes.
         """
         self.base_url = base_url.rstrip("/")
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout))
+        self._prepare_timeout = prepare_timeout
 
     async def health_check(self) -> bool:
         """Check if the face animation service is healthy.
@@ -73,6 +78,7 @@ class FaceAnimationClient:
             f"{self.base_url}/prepare",
             files={"video": (filename, video_bytes)},
             data={"avatar_id": avatar_id},
+            timeout=self._prepare_timeout,
         )
         resp.raise_for_status()
         result = resp.json()

@@ -112,6 +112,27 @@ class FaceVoiceClient:
             logger.error("Connection failed: %s", e)
             return False
 
+    async def _load_idle_frames(self) -> None:
+        """Fetch reference frames so the window stays alive between turns."""
+        if not self._ws:
+            return
+        try:
+            await self._ws.send(msgpack.packb({
+                "type": "face_idle_frames",
+                "ts": time.time(),
+            }))
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=20.0)
+            response = msgpack.unpackb(raw, raw=False)
+            if response.get("type") != "face_idle_frames":
+                return
+            frames = response.get("frames") or []
+            if frames:
+                self._video_display.set_idle_frames(frames)
+            else:
+                logger.info("No idle frames available (face not enabled?)")
+        except Exception:
+            logger.debug("Idle frames unavailable", exc_info=True)
+
     async def _initialize_asr(self) -> bool:
         """Download model and initialize the speech transcriber.
 
@@ -310,11 +331,9 @@ class FaceVoiceClient:
                             await audio_queue.put(audio_data)
 
                     elif msg_type == "chat_video":
-                        frame_b64 = response.get("frame", "")
-                        if frame_b64:
-                            self._video_display.show_frame(
-                                base64.b64decode(frame_b64)
-                            )
+                        frame = response.get("frame")
+                        if frame:
+                            self._video_display.show_frame(frame)
 
                     elif msg_type == "chat_done":
                         print()  # newline after streaming tokens
@@ -469,6 +488,7 @@ class FaceVoiceClient:
 
         # Start video display
         self._video_display.start()
+        await self._load_idle_frames()
 
         # Start mic capture
         self._transcriber.start()

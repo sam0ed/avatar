@@ -32,46 +32,57 @@ Real-time digital avatar clone: captures the user's voice via microphone, genera
 
 ```
 avatar/
+├── CLAUDE.md                 # Auto-loaded pointer to this file + the two habits
 ├── AGENTS.md                 # This file — project memory
 ├── .github/
 │   ├── copilot-instructions.md   # Coding conventions (always-on)
-│   ├── prompts/
-│   │   └── plan-digitalAvatarClone.prompt.md  # Master build plan
-│   └── instructions/         # File-pattern-based rules (future)
+│   └── prompts/
+│       └── plan-digitalAvatarClone.prompt.md  # Master build plan
 ├── server/                   # Vast.ai server code
 │   ├── pyproject.toml        # uv-managed dependencies
-│   ├── src/
-│   │   ├── llm/
-│   │   │   ├── client.py         # Async LLM client (OpenAI-compat SSE streaming)
-│   │   │   ├── chunker.py        # Sentence boundary detection for streaming TTS
-│   │   │   └── system_prompt.txt  # System prompt (placeholder)
-│   │   ├── tts/
-│   │   │   └── client.py         # Async Fish Speech TTS client
-│   │   ├── face/             # MuseTalk wrapper (future)
-│   │   └── api/
-│   │       └── server.py     # FastAPI + WebSocket (chat/ping/echo)
-│   └── Dockerfile
-├── client/                   # Local Windows orchestrator
+│   └── src/
+│       ├── llm/
+│       │   ├── client.py         # Async LLM client (OpenAI-compat SSE streaming)
+│       │   ├── chunker.py        # Sentence boundary detection for streaming TTS
+│       │   └── system_prompt.txt # System prompt (placeholder)
+│       ├── tts/
+│       │   └── client.py         # Async Fish Speech TTS client
+│       ├── face/                 # MuseTalk service — copied into /opt/musetalk at boot
+│       │   ├── client.py             # Async client the orchestrator talks to
+│       │   ├── face_server.py        # FastAPI service on :8002, sessions
+│       │   ├── musetalk_models.py    # Weight loading, output config
+│       │   ├── musetalk_avatar.py    # Reference video → frames/latents/masks + disk cache
+│       │   ├── musetalk_audio.py     # PCM → sliding-window whisper chunks
+│       │   └── musetalk_render.py    # Batched UNet + VAE + blending → JPEG
+│       └── api/
+│           └── server.py     # FastAPI + WebSocket, decoupled A/V pipeline
+├── client/                   # Local Windows client
 │   ├── pyproject.toml        # uv-managed dependencies
-│   ├── src/
-│   │   ├── asr/
-│   │   │   ├── transcriber.py     # Moonshine Voice ASR wrapper (VAD+ASR, CPU)
-│   │   │   └── smart_turn.py      # Smart Turn v3.2 ONNX end-of-turn detector
-│   │   ├── audio/
-│   │   │   └── playback.py        # Audio player with cancel support
-│   │   ├── video/            # pyvirtualcam output (future)
-│   │   ├── orchestrator.py   # Main pipeline coordinator
-│   │   ├── voice_client.py   # Voice conversation client (mic → ASR → LLM → TTS → speaker)
-│   │   ├── chat_client.py    # Terminal chat client with audio playback
-│   │   └── tts_test.py       # Fish Speech TTS test client
+│   └── src/
+│       ├── asr/
+│       │   ├── transcriber.py     # Moonshine Voice ASR wrapper (VAD+ASR, CPU)
+│       │   └── smart_turn.py      # Smart Turn v3.2 ONNX end-of-turn detector
+│       ├── audio/
+│       │   └── playback.py        # Audio player with pause/resume/cancel
+│       ├── video/
+│       │   └── display.py         # OpenCV window, live + idle playback
+│       ├── voice_client.py        # Voice-only conversation client
+│       ├── face_voice_client.py   # Voice + face conversation client
+│       ├── chat_client.py         # Terminal chat client with audio playback
+│       └── tts_test.py            # Fish Speech TTS test client
 ├── scripts/
-│   ├── record_voice.py       # Interactive voice recording for cloning
-│   ├── deploy_tts.py         # Deploy Fish Speech to Vast.ai
-│   └── deploy_stage2.py      # Deploy Stage 2 single container to Vast.ai
-├── docker/                   # Dockerfiles, deployment scripts, vast.ai helpers
+│   ├── deploy_tts.py         # Deploy Fish Speech to Vast.ai (Stage 1)
+│   ├── deploy_stage2.py      # Deploy audio-only pipeline to Vast.ai
+│   ├── deploy_face.py        # Deploy with FACE_ENABLED=true (Stage 4)
+│   ├── setup_voice.py        # Upload voice references + enable cloning
+│   └── setup_face.py         # Upload reference video + enable face
+├── docker/
 │   ├── Dockerfile            # Stage 0 orchestrator container (slim)
-│   ├── supervisord.conf      # Process manager config for Stage 2 (3 services)
-│   └── entrypoint_stage2.sh  # Model download + supervisord start
+│   ├── supervisord.conf      # Process manager config (LLM, TTS, musetalk, orchestrator)
+│   └── entrypoint_stage2.sh  # Model download + venv setup + supervisord start
+├── docs/                     # Research notes (untracked, local only)
+├── video/                    # Reference video for face animation (gitignored)
+├── recordings/               # Voice samples for cloning (gitignored)
 └── models/                   # Model configs and download scripts (gitignored)
 ```
 
@@ -118,11 +129,17 @@ avatar/
 
 ## Current Stage
 
-**Stage 3: Speech-to-Speech Conversation** — IN PROGRESS
+**Stage 4: Face Animation (MuseTalk 1.5)** — REWRITTEN, NOT YET RUN
 
-Core voice loop implemented. Moonshine Voice ASR + barge-in with pre-filters + Smart Turn v3.2 end-of-turn detection. New files: `client/src/asr/transcriber.py` (SpeechTranscriber with speech duration tracking + audio ring buffer), `client/src/asr/smart_turn.py` (SmartTurnAnalyzer — ONNX inference), `client/src/audio/playback.py` (AudioPlayer with cancel), `client/src/voice_client.py` (VoiceClient — full voice conversation loop with barge-in pre-filters + Smart Turn). Server updated: chat runs as background asyncio task, `chat_cancel` message type for barge-in. Pending: end-to-end testing with Vast.ai server.
+The face service has been rebuilt against MuseTalk's real API and split into `musetalk_models.py`,
+`musetalk_avatar.py`, `musetalk_audio.py`, `musetalk_render.py` and `face_server.py` under `server/src/face/`.
+It has still **never been executed** — no instance has been deployed with `FACE_ENABLED=true`. Treat the first
+deploy as the verification step for the whole stage, not as a routine boot.
 
-
+Stage 3 (speech-to-speech with barge-in) is complete and verified in real spoken conversations, and is
+unaffected by any of the above: face animation is gated behind `FACE_ENABLED` at five points (deploy script,
+entrypoint, supervisord `autostart`, orchestrator import, and a per-turn `_active_avatar_id` check), and the
+entrypoint's face block is non-fatal, so `deploy_stage2.py` cannot reach face code at all.
 
 ## Progress Log
 
@@ -138,6 +155,9 @@ Core voice loop implemented. Moonshine Voice ASR + barge-in with pre-filters + S
 | 2026-03-XX | Stage 3 | Implementation: Moonshine Voice ASR wrapper (`client/src/asr/transcriber.py`), audio player with cancel (`client/src/audio/playback.py`), voice conversation client (`client/src/voice_client.py`). Server restructured: chat as background task + `chat_cancel` message type (`server/src/api/server.py`). Mic muting during playback (no barge-in V1). Plan + architecture diagram updated. |
 | 2026-03-01 | Stage 3 | **Barge-in implemented.** Mic stays active during avatar speech — Moonshine VAD detects user interruption → cancels playback (`AudioPlayer.cancel()`) + server pipeline (`chat_cancel`) → barge-in text feeds directly into next turn. Relies on laptop mic's built-in echo cancellation to filter speaker output. Researched Pipecat, LiveKit, Vocode barge-in architectures (see `docs/research-asr-turn-taking.md`). |
 | 2026-03-01 | Stage 3 | **Barge-in pre-filters + Smart Turn.** Added three pre-filters to reduce false interruptions: backchannel regex (mhm/yeah/okay/etc.), `MIN_INTERRUPTION_WORDS=2`, `MIN_INTERRUPTION_DURATION=0.5s`. Filtered speech is silently ignored (zero audio disruption). Added Smart Turn v3.2 ONNX end-of-turn detection (`client/src/asr/smart_turn.py`): analyzes prosody on up to 8s audio after Moonshine VAD silence, accumulates speech segments until turn complete or 3s timeout. New deps: `transformers>=4.40`, `onnxruntime>=1.17`, `huggingface-hub>=0.23`. Pause/resume and preemptive generation deferred. |
+| 2026-03-08 | Stage 3 | **Stage 3 COMPLETE — verified in real conversations.** Barge-in rewritten to pause/verify/resume (LiveKit pattern) with fade-out instead of hard cancel (`462db4f`). Fixed self-interruption by waiting for playback to start before monitoring (`f2c15c4`). Added ASR error tolerance + interruption context for the LLM (`bc23e1d`). Fixed the interrupted marker leaking into speech output (`a0c6cd6`). Fixed TTS torch.compile failure by symlinking `libcuda.so` for Triton's link step (`64e6bcd`) — the `-lcuda` error in `logs.md` predates this fix and is resolved. |
+| 2026-03-08 | Stage 4 | **Code written, NEVER EXECUTED.** ~2,300 lines committed in `1c8c0fb`: `face_server.py` (standalone MuseTalk service, :8002), `face/client.py`, decoupled A/V fork in `server.py`, `video/display.py`, `face_voice_client.py`, `deploy_face.py`, `setup_face.py`, MuseTalk venv + model download in the entrypoint, supervisord program. No instance was ever deployed with `FACE_ENABLED=true` and there are no follow-up fix commits — every other stage has several, produced by actually running it. Reference video recorded (`video/WIN_20260308_14_11_18_Pro.mp4`, 1280×720, 16s, 479 frames) but never uploaded. `face_server.py` was written against a MuseTalk API that does not exist and would have crashed at startup. This row was written retroactively on 2026-08-15; the original commit recorded no caveat, which is why `CLAUDE.md` now asks for verification status in commit messages. |
+| 2026-08-15 | Stage 4 | **Face service rewritten against MuseTalk's real API. Still not run.** Split the 703-line `face_server.py` into `musetalk_models.py` (loading, weight preflight), `musetalk_avatar.py` (reference video → frames/latents/masks), `musetalk_audio.py` (PCM → `[T,50,384]` whisper chunks), `musetalk_render.py` (batched UNet + VAE + blending) and a thin `face_server.py` (HTTP + sessions). Every MuseTalk call site verified against upstream `main` rather than recalled. Orchestrator fixes: `/face/enable` compared against the wrong dict level so face could never be enabled; `/face/prepare` passed `avatar_id=None`; `/face/avatars` double-nested its response; prepare timeout raised from 60s. Client fix: `VideoDisplay.advance_frame()` was never called, so the window stayed blank — the display thread now paces itself at 25fps. Entrypoint: MuseTalk pins, official weight layout, whisper download added, `gdown --id` (removed in gdown 6.x) → positional id, and the whole face block made non-fatal. Concurrency: GPU work serialised off the event loop, sessions hold an `AvatarData` snapshot so re-preparing an avatar cannot mutate a live stream, idle sessions swept. Verified by an adversarial subagent review against upstream source; 12 findings, all triaged. |
 
 ## Important Decisions & Context
 
@@ -170,6 +190,10 @@ Core voice loop implemented. Moonshine Voice ASR + barge-in with pre-filters + S
 - **Fish Speech Docker**: Use `fishaudio/fish-speech:server-cuda` tag (not `latest-server-cuda`). The `fish` user (UID 1000) defined in the Dockerfile does not exist in Vast.ai runtime — run `start_server.sh` as root directly (not via `su fish`). Model weights are gated on HuggingFace — requires HF token.
 - **HF_TOKEN required**: The `fishaudio/openaudio-s1-mini` model is gated. Must accept license at https://huggingface.co/fishaudio/openaudio-s1-mini and provide token via `HF_TOKEN` env var or `.env` file.
 - **Vast.ai SSH**: Use `vastai create ssh-key` (not `set ssh-key`). Key propagation to running instances may take a moment.
+- **MuseTalk is driven through its own API, never re-derived**: use `scripts/realtime_inference.py` in the MuseTalk checkout as the reference for any change to the face service. The first Stage 4 attempt was written from memory of that API and every call site was wrong. All MuseTalk model paths are relative to its repo root, so the face service runs with `cwd=/opt/musetalk` (set by supervisord `directory=` and again by `enter_musetalk_root()`). Note the upstream folder is spelled `face-parse-bisent`, not `bisenet`.
+- **MuseTalk venv pins torch 2.0.1 / cu118**: `mmcv==2.0.1` only publishes pre-built wheels for torch 2.0.x on cu118. On any newer torch, `mim` falls back to compiling from source, which needs `nvcc` that the Fish Speech runtime base image does not have. Do not "modernise" this pin without also solving mmcv. It is isolated in `/opt/musetalk-venv` and cannot affect the LLM (`/opt/llm-venv`) or TTS (`/app/.venv`) environments — that isolation is the reason four Python environments exist in one container.
+- **Face setup is non-fatal**: the `FACE_ENABLED` block in `entrypoint_stage2.sh` runs with `set +e` because face animation is optional, and a failed MuseTalk install must not abort the entrypoint before supervisord starts the LLM, TTS and orchestrator.
+- **Streaming lip sync is approximate by construction**: whisper's encoder attends globally over its 30s input, so each new audio chunk shifts encoder output at every position in the trailing segment — including positions backing frames already sent. Early frames of a response are computed against a mostly zero-padded future. Making streaming features match offline ones requires a fixed sliding window with explicit left context, which is a design change, not a constant to tune.
 
 ## Vast.ai Instance Log
 

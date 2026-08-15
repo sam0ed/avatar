@@ -20,11 +20,12 @@ import numpy as np
 
 logger = logging.getLogger("avatar.video")
 
-# Idle animation frame rate (cycles through reference frames)
 _IDLE_FPS = 5
 _IDLE_INTERVAL = 1.0 / _IDLE_FPS
 
-# Window name
+_LIVE_FPS = 25
+_LIVE_INTERVAL = 1.0 / _LIVE_FPS
+
 _WINDOW_NAME = "Avatar"
 
 
@@ -36,7 +37,7 @@ class VideoDisplay:
     """
 
     def __init__(self) -> None:
-        self._frame_buffer: deque[np.ndarray] = deque(maxlen=60)  # ~2.4s at 25fps
+        self._frame_buffer: deque[np.ndarray] = deque(maxlen=60)
         self._idle_frames: list[np.ndarray] = []
         self._idle_idx: int = 0
         self._current_frame: np.ndarray | None = None
@@ -112,29 +113,31 @@ class VideoDisplay:
         """Main display thread loop — renders frames via cv2.imshow."""
         cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_NORMAL)
         last_idle_time = 0.0
+        last_live_time = 0.0
 
         while self._running:
+            now = time.monotonic()
             with self._lock:
                 idle = self._idle_mode
-                frame = self._current_frame
 
             if idle:
-                # Idle mode: cycle reference frames at _IDLE_FPS
-                now = time.monotonic()
                 if self._idle_frames and now - last_idle_time >= _IDLE_INTERVAL:
                     with self._lock:
-                        frame = self._idle_frames[self._idle_idx]
+                        self._current_frame = self._idle_frames[self._idle_idx]
                         self._idle_idx = (self._idle_idx + 1) % len(self._idle_frames)
-                        self._current_frame = frame
                     last_idle_time = now
+            elif now - last_live_time >= _LIVE_INTERVAL:
+                self.advance_frame()
+                last_live_time = now
+
+            with self._lock:
+                frame = self._current_frame
 
             if frame is not None:
                 cv2.imshow(_WINDOW_NAME, frame)
 
-            # cv2.waitKey is required for the window to process events.
-            # 16ms ≈ 60Hz refresh rate for the GUI loop.
             key = cv2.waitKey(16) & 0xFF
-            if key == 27:  # ESC to close
+            if key == 27:
                 self._running = False
                 break
 
