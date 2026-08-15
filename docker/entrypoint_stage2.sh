@@ -15,6 +15,7 @@ export N_CTX="${N_CTX:-8192}"
 export FLASH_ATTN="${FLASH_ATTN:-true}"
 export LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8001}"
 export TTS_BASE_URL="${TTS_BASE_URL:-http://localhost:8080}"
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
 echo "============================================="
 echo "  Avatar Stage 2 — Unified Container"
@@ -50,7 +51,7 @@ if [ ! -f "$TTS_CHECKPOINT" ]; then
     echo ""
     echo "[2/2] Downloading TTS model: openaudio-s1-mini ..."
     cd /app
-    uv run python -c "
+    uv run --with hf_transfer python -c "
 from huggingface_hub import snapshot_download
 import os
 snapshot_download(
@@ -80,6 +81,9 @@ if [ "$FACE_ENABLED" = "true" ]; then
         echo "[3a] MuseTalk already cloned at $MUSETALK_DIR"
     fi
 
+    PIN="numpy==1.23.5 opencv-python==4.9.0.80"
+    MMCV_INDEX="https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html"
+
     if [ ! -d "$MUSETALK_VENV" ]; then
         echo "[3b] Creating MuseTalk venv + installing deps ..."
         python3.11 -m venv "$MUSETALK_VENV"
@@ -89,15 +93,31 @@ if [ "$FACE_ENABLED" = "true" ]; then
         "$MUSETALK_VENV/bin/pip" install -r "$MUSETALK_DIR/requirements.txt"
         "$MUSETALK_VENV/bin/pip" install --no-cache-dir -U openmim
         "$MUSETALK_VENV/bin/mim" install "mmengine"
-        "$MUSETALK_VENV/bin/pip" install "mmcv==2.0.1" \
-            -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html
-        "$MUSETALK_VENV/bin/python" -c "import mmcv, mmcv.ops; print('mmcv', mmcv.__version__, 'ops OK')" \
-            || echo "[3b] ERROR: mmcv has no compiled ops; face animation will not work"
+        "$MUSETALK_VENV/bin/pip" install "mmcv==2.0.1" --only-binary mmcv -f "$MMCV_INDEX"
+        "$MUSETALK_VENV/bin/pip" install $PIN
         "$MUSETALK_VENV/bin/mim" install "mmdet==3.1.0"
-        "$MUSETALK_VENV/bin/mim" install "mmpose==1.1.0"
-        "$MUSETALK_VENV/bin/pip" install fastapi uvicorn python-multipart
+        "$MUSETALK_VENV/bin/pip" install "matplotlib==3.7.5"
+        "$MUSETALK_VENV/bin/pip" install "mmpose==1.1.0" --no-build-isolation
+        "$MUSETALK_VENV/bin/pip" install $PIN
+        "$MUSETALK_VENV/bin/pip" install fastapi uvicorn python-multipart hf_transfer hf_xet
     else
         echo "[3b] MuseTalk venv already exists at $MUSETALK_VENV"
+    fi
+
+    echo "[3b] Verifying MuseTalk imports ..."
+    MUSETALK_OK=1
+    for CHECK in \
+        "import numpy, cv2; print('numpy', numpy.__version__, 'cv2', cv2.__version__)" \
+        "import mmcv, mmcv.ops; print('mmcv.ops OK')" \
+        "from mmpose.apis import inference_topdown, init_model; print('mmpose OK')" \
+        "from diffusers import AutoencoderKL; print('diffusers OK')" \
+        "from transformers import WhisperModel; print('transformers OK')"
+    do
+        "$MUSETALK_VENV/bin/python" -c "$CHECK" 2>&1 | tail -1 || MUSETALK_OK=0
+    done
+    if [ "$MUSETALK_OK" != "1" ]; then
+        echo "[3b] ERROR: MuseTalk environment is broken; face animation will not start."
+        echo "      Audio pipeline is unaffected. See AGENTS.md 'MuseTalk dependency order'."
     fi
 
     if [ ! -f "$MUSETALK_DIR/models/musetalkV15/unet.pth" ]; then

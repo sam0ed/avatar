@@ -77,7 +77,7 @@ def build_onstart_cmd() -> str:
         # 2. LLM venv + deps (pre-built CUDA 12.4 wheel for Python 3.11)
         "python3.11 -m venv /opt/llm-venv"
         " && /opt/llm-venv/bin/pip install"
-        " 'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1'"
+        " 'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1' hf_transfer"
         " --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"
         " --extra-index-url https://pypi.org/simple",
         # 3. Clone repo
