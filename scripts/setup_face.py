@@ -88,7 +88,7 @@ def prepare_avatar(base_url: str, video_path: Path, avatar_id: str | None = None
             f"{base_url}/face/prepare",
             files=files,
             data=data,
-            timeout=120.0,  # Avatar preparation can take time
+            timeout=1800.0,  # Face detection + VAE encode + masks over every frame
         )
         result = resp.json()
         if "error" in result:
