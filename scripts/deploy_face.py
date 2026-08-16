@@ -28,6 +28,7 @@ Notes:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -89,7 +90,8 @@ def search_offers() -> str | None:
     result = subprocess.run(
         [
             "vastai", "search", "offers",
-            "gpu_name=RTX_4090 num_gpus=1 reliability>0.95 disk_space>=120 inet_down>=700",
+            "gpu_name=RTX_4090 num_gpus=1 reliability>0.95 disk_space>=120"
+            " inet_down>=700 disk_bw>=2000",
             "-o", "dph+", "--limit", "20", "--raw",
         ],
         capture_output=True,
@@ -114,6 +116,7 @@ def search_offers() -> str | None:
         print(
             f"  ID {o['id']:>10}  ${o['dph_total']:.3f}/hr  "
             f"RAM={ram_gb:.0f}GB  "
+            f"disk_bw={o.get('disk_bw', 0):.0f}MB/s  "
             f"{o.get('geolocation', 'Unknown'):20s}  "
             f"R={o.get('reliability2', 0) * 100:.0f}%"
         )
@@ -127,6 +130,11 @@ def main() -> None:
     """Deploy Stage 4 (with face animation) to Vast.ai."""
     parser = argparse.ArgumentParser(description="Deploy Stage 4 (Face Animation) to Vast.ai")
     parser.add_argument("--offer", help="Vast.ai offer ID (skips search)")
+    parser.add_argument(
+        "--no-face",
+        action="store_true",
+        help="Deploy with FACE_ENABLED=false (skips MuseTalk weights; isolates the audio pipeline)",
+    )
     args = parser.parse_args()
 
     hf_token = get_hf_token()
@@ -141,9 +149,10 @@ def main() -> None:
 
     # --- Create instance ---
     onstart_cmd = build_onstart_cmd()
+    face_enabled = "false" if args.no_face else "true"
     env_flags = (
         f"-e HF_TOKEN={hf_token}"
-        " -e FACE_ENABLED=true"
+        f" -e FACE_ENABLED={face_enabled}"
         " -p 8000:8000 -p 8001:8001 -p 8080:8080 -p 8002:8002"
     )
 
@@ -159,25 +168,33 @@ def main() -> None:
         "--onstart-cmd", onstart_cmd,
     ]
 
-    print(f"\nCreating instance with image {IMAGE} (FACE_ENABLED=true)...")
+    print(f"\nCreating instance with image {IMAGE} (FACE_ENABLED={face_enabled})...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     print(result.stdout)
     if result.stderr:
         print(result.stderr, file=sys.stderr)
 
-    if result.returncode == 0 and "success" in result.stdout.lower():
-        print("Instance created. Dep install (~5 min) + model download (~15-20 min).")
-        print("\nAfter instance starts:")
-        print("  vastai show instances")
-        print("  vastai ssh-url <INSTANCE_ID>")
-        print("  # Health:    curl http://<ip>:8000/health")
-        print("  # Face setup: uv run scripts/setup_face.py --url http://<ip>:8000")
-        print("  # Voice:     cd client && uv run python src/face_voice_client.py ws://<ip>:8000/ws")
-        print("  # Logs:      ssh -p <port> root@<host> 'supervisorctl status'")
-        print("  # Destroy:   vastai destroy instance <INSTANCE_ID>")
-    else:
+    contract = re.search(r"['\"]new_contract['\"]:\s*(\d+)", result.stdout)
+    if result.returncode != 0 or contract is None:
         print("ERROR: Instance creation failed.", file=sys.stderr)
         sys.exit(1)
+
+    instance_id = contract.group(1)
+    if not re.search(r"['\"]success['\"]:\s*[Tt]rue", result.stdout):
+        print(
+            f"WARNING: Vast.ai reported success=False but returned contract {instance_id}. "
+            "Verify with 'vastai show instances' before assuming the deploy failed.",
+            file=sys.stderr,
+        )
+
+    print(f"Instance {instance_id} created. Image pull + model download.")
+    print("\nAfter instance starts:")
+    print(f"  vastai show instances --raw")
+    print(f"  vastai ssh-url {instance_id}")
+    print("  # Health:    curl http://<ip>:8000/health")
+    print(f"  # Face setup: uv run scripts/setup_face.py --url http://<ip>:8000")
+    print("  # Voice:     cd client && uv run python src/face_voice_client.py ws://<ip>:8000/ws")
+    print(f"  # Destroy:   vastai destroy instance {instance_id} -y")
 
 
 if __name__ == "__main__":
