@@ -25,10 +25,14 @@ RUN git clone --filter=blob:none https://github.com/fishaudio/fish-speech.git /o
     && VIRTUAL_ENV=/opt/fish-speech/.venv uv pip install \
         'huggingface_hub>=0.25,<1' hf_transfer hf_xet
 
-RUN /opt/fish-speech/.venv/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
-    && /opt/fish-speech/.venv/bin/python -c "import huggingface_hub, hf_transfer; print('hf_hub OK')" \
-    && /opt/fish-speech/.venv/bin/python -c "import tiktoken, ormsgpack; print('tiktoken + ormsgpack OK')" \
-    && /opt/fish-speech/.venv/bin/python -c "from fish_speech.tokenizer import FishTokenizer; import inspect; assert 'tiktoken' in inspect.getsource(FishTokenizer.__init__); print('FishTokenizer is tiktoken-based')"
+RUN rm -rf /app && mkdir -p /app
+
+WORKDIR /opt/fish-speech
+RUN .venv/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
+    && .venv/bin/python -c "import huggingface_hub, hf_transfer; print('hf_hub OK')" \
+    && .venv/bin/python -c "import tiktoken, ormsgpack; print('tiktoken + ormsgpack OK')" \
+    && .venv/bin/python -c "import fish_speech, inspect; from fish_speech.tokenizer import FishTokenizer; assert fish_speech.__file__.startswith('/opt/fish-speech/'), fish_speech.__file__; assert 'tiktoken' in inspect.getsource(FishTokenizer.__init__); print('tiktoken-based FishTokenizer from', fish_speech.__file__)"
+WORKDIR /app
 
 RUN git clone --depth 1 https://github.com/TMElyralab/MuseTalk.git /opt/musetalk
 
