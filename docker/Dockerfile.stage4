@@ -1,4 +1,4 @@
-FROM fishaudio/fish-speech:server-cuda
+FROM fishaudio/fish-speech:server-cuda@sha256:5a82e482f1c5d42b3b17258e24c415117864e019969d2601f614069087885ed9
 
 USER root
 
@@ -16,6 +16,19 @@ RUN python3.11 -m venv /opt/llm-venv \
         'llama-cpp-python[server]>=0.3,<1' 'huggingface_hub>=0.25,<1' hf_transfer hf_xet \
         --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 \
         --extra-index-url https://pypi.org/simple
+
+ARG FISH_SPEECH_COMMIT=d3df50503b36
+RUN git clone --filter=blob:none https://github.com/fishaudio/fish-speech.git /opt/fish-speech \
+    && git -C /opt/fish-speech checkout ${FISH_SPEECH_COMMIT} \
+    && cd /opt/fish-speech \
+    && uv sync --frozen --extra cu126 \
+    && VIRTUAL_ENV=/opt/fish-speech/.venv uv pip install \
+        'huggingface_hub>=0.25,<1' hf_transfer hf_xet
+
+RUN /opt/fish-speech/.venv/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
+    && /opt/fish-speech/.venv/bin/python -c "import huggingface_hub, hf_transfer; print('hf_hub OK')" \
+    && /opt/fish-speech/.venv/bin/python -c "import tiktoken, ormsgpack; print('tiktoken + ormsgpack OK')" \
+    && /opt/fish-speech/.venv/bin/python -c "from fish_speech.tokenizer import FishTokenizer; import inspect; assert 'tiktoken' in inspect.getsource(FishTokenizer.__init__); print('FishTokenizer is tiktoken-based')"
 
 RUN git clone --depth 1 https://github.com/TMElyralab/MuseTalk.git /opt/musetalk
 
@@ -42,4 +55,6 @@ RUN /opt/musetalk-venv/bin/python -c "import numpy, cv2; print('numpy', numpy.__
     && /opt/musetalk-venv/bin/python -c "import mmpose; print('mmpose', mmpose.__version__)" \
     && /opt/musetalk-venv/bin/python -c "from diffusers import AutoencoderKL; print('diffusers OK')"
 
-RUN mkdir -p /app/references /app/avatars /var/log/supervisor /models
+RUN mkdir -p /app/references /app/avatars /var/log/supervisor /models \
+    && mkdir -p /opt/fish-speech/checkpoints \
+    && ln -s /app/references /opt/fish-speech/references

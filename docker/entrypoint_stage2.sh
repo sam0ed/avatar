@@ -46,17 +46,16 @@ else
 fi
 
 # --- 2. Download TTS model ---
-TTS_CHECKPOINT="/app/checkpoints/openaudio-s1-mini/model.pth"
+TTS_CHECKPOINT="/opt/fish-speech/checkpoints/openaudio-s1-mini/model.pth"
 if [ ! -f "$TTS_CHECKPOINT" ]; then
     echo ""
     echo "[2/2] Downloading TTS model: openaudio-s1-mini ..."
-    cd /app
-    uv run --with hf_transfer python -c "
+    /opt/fish-speech/.venv/bin/python -c "
 from huggingface_hub import snapshot_download
 import os
 snapshot_download(
     'fishaudio/openaudio-s1-mini',
-    local_dir='checkpoints/openaudio-s1-mini',
+    local_dir='/opt/fish-speech/checkpoints/openaudio-s1-mini',
     token=os.environ.get('HF_TOKEN'),
 )
 print('TTS model download complete.')
