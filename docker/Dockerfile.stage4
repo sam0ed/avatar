@@ -31,7 +31,7 @@ WORKDIR /opt/fish-speech
 RUN .venv/bin/python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
     && .venv/bin/python -c "import huggingface_hub, hf_transfer; print('hf_hub OK')" \
     && .venv/bin/python -c "import tiktoken, ormsgpack; print('tiktoken + ormsgpack OK')" \
-    && .venv/bin/python -c "import fish_speech, inspect; from fish_speech.tokenizer import FishTokenizer; assert fish_speech.__file__.startswith('/opt/fish-speech/'), fish_speech.__file__; assert 'tiktoken' in inspect.getsource(FishTokenizer.__init__); print('tiktoken-based FishTokenizer from', fish_speech.__file__)"
+    && .venv/bin/python -c "import inspect; from fish_speech.tokenizer import FishTokenizer; src = inspect.getfile(FishTokenizer); assert src.startswith('/opt/fish-speech/'), src; assert 'tiktoken' in inspect.getsource(FishTokenizer.__init__), src; print('tiktoken-based FishTokenizer from', src)"
 WORKDIR /app
 
 RUN git clone --depth 1 https://github.com/TMElyralab/MuseTalk.git /opt/musetalk
