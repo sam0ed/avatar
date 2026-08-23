@@ -1,0 +1,209 @@
+diff --git a/fish_speech/inference_engine/__init__.py b/fish_speech/inference_engine/__init__.py
+index f54de5b..e392c01 100644
+--- a/fish_speech/inference_engine/__init__.py
++++ b/fish_speech/inference_engine/__init__.py
+@@ -1,4 +1,5 @@
+ import gc
++import os
+ import queue
+ from typing import Generator
+ 
+@@ -82,6 +83,8 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
+             )
+ 
+         segments = []
++        stream_codes = None
++        stream_emitted = 0
+ 
+         while True:
+             # Get the response from the LLAMA model
+@@ -106,7 +109,17 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
+ 
+             result: GenerateResponse = wrapped_result.response
+             if result.action != "next":
+-                segment = self.get_audio_segment(result)
++                if getattr(result, "partial", False):
++                    if stream_codes is None:
++                        stream_codes = result.codes
++                    else:
++                        stream_codes = torch.cat([stream_codes, result.codes], dim=1)
++                    decoded = self.decode_vq_tokens(codes=stream_codes)
++                    audio_np = decoded.float().cpu().numpy()
++                    segment = audio_np[stream_emitted:]
++                    stream_emitted = len(audio_np)
++                else:
++                    segment = self.get_audio_segment(result)
+ 
+                 if req.streaming:  # Used only by the API server
+                     yield InferenceResult(
+diff --git a/fish_speech/models/text2semantic/inference.py b/fish_speech/models/text2semantic/inference.py
+index d940be4..7c3c384 100644
+--- a/fish_speech/models/text2semantic/inference.py
++++ b/fish_speech/models/text2semantic/inference.py
+@@ -388,6 +388,131 @@ class GenerateResponse:
+     action: Literal["sample", "next"]
+     codes: Optional[torch.Tensor] = None
+     text: Optional[str] = None
++    partial: bool = False
++
++
++STREAM_CHUNK_FRAMES = int(os.environ.get("FISH_STREAM_CHUNK_FRAMES", "0"))
++
++
++@torch.no_grad()
++@torch.inference_mode()
++def generate_stream(
++    *,
++    model: DualARTransformer,
++    prompt: torch.Tensor,
++    max_new_tokens: int,
++    audio_masks: torch.Tensor,
++    audio_parts: torch.Tensor,
++    decode_one_token=decode_one_token_ar,
++    chunk_frames: int = 25,
++    **sampling_kwargs,
++):
++    """generate(), but yielding codebook chunks while sampling; token parity with the batch path."""
++    T = prompt.size(1)
++    prompt = prompt[None]
++
++    if T >= model.config.max_seq_len:
++        raise ValueError(
++            f"Input sequence length {T} exceeds max_seq_len {model.config.max_seq_len}"
++        )
++
++    if max_new_tokens:
++        if T + max_new_tokens > model.config.max_seq_len:
++            max_new_tokens = model.config.max_seq_len - T
++    else:
++        max_new_tokens = model.config.max_seq_len - T
++
++    device = prompt.device
++
++    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
++        with torch.device(device):
++            model.setup_caches(
++                max_batch_size=1,
++                max_seq_len=model.config.max_seq_len,
++                dtype=next(model.parameters()).dtype,
++            )
++        model._cache_setup_done = True
++
++    codebook_dim = 1 + model.config.num_codebooks
++    input_pos = torch.arange(0, T, device=device, dtype=torch.long)
++
++    temperature = torch.tensor(
++        sampling_kwargs.get("temperature", 0.7), device=device, dtype=torch.float
++    )
++    top_p = torch.tensor(
++        sampling_kwargs.get("top_p", 0.7), device=device, dtype=torch.float
++    )
++    repetition_penalty = torch.tensor(
++        sampling_kwargs.get("repetition_penalty", 1.5),
++        device=device,
++        dtype=torch.float,
++    )
++
++    first_token = decode_one_token_ar(
++        model,
++        prompt.view(1, codebook_dim, -1),
++        input_pos,
++        temperature,
++        top_p,
++        repetition_penalty,
++        audio_masks,
++        audio_parts,
++    )
++
++    input_pos = torch.tensor([T], device=device, dtype=torch.int)
++    previous_tokens = torch.zeros(
++        (codebook_dim, model.config.max_seq_len),
++        dtype=torch.int,
++        device=device,
++    )
++    im_end_id = model.tokenizer.get_token_id(IM_END_TOKEN)
++
++    cur_token = first_token.view(1, codebook_dim, -1)
++    columns = [first_token.view(codebook_dim, 1).long().clone()]
++    emitted_upto = 0
++
++    def flush(upto: int) -> torch.Tensor:
++        nonlocal emitted_upto
++        chunk = torch.cat(columns[emitted_upto:upto], dim=1)[1:].clone()
++        emitted_upto = upto
++        return chunk
++
++    finished = False
++    for i in range(max_new_tokens - 1):
++        win_size = 16
++        if i < win_size:
++            window = previous_tokens[:, :win_size]
++        else:
++            window = previous_tokens[:, i - win_size : i]
++
++        with sdpa_kernel(SDPBackend.MATH):
++            next_token = decode_one_token(
++                model=model,
++                x=cur_token,
++                input_pos=input_pos,
++                previous_tokens=window,
++                temperature=temperature,
++                top_p=top_p,
++                repetition_penalty=repetition_penalty,
++                audio_masks=audio_masks,
++                audio_parts=audio_parts,
++            ).clone()
++
++        input_pos += 1
++        cur_token = next_token.view(1, codebook_dim, -1)
++        previous_tokens[:, i : i + 1] = next_token.view(codebook_dim, -1)
++
++        if cur_token[0, 0, -1] == im_end_id:
++            finished = True
++            break
++
++        columns.append(next_token.view(codebook_dim, 1).long().clone())
++        if len(columns) - 1 - emitted_upto >= chunk_frames:
++            yield flush(len(columns) - 1)
++
++    final_upto = len(columns) if finished else len(columns) - 1
++    if final_upto > emitted_upto:
++        yield flush(final_upto)
+ 
+ 
+ def generate_long(
+@@ -466,6 +591,34 @@ def generate_long(
+ 
+         t0 = time.perf_counter()
+ 
++        if STREAM_CHUNK_FRAMES > 0:
++            total_streamed = 0
++            for codes in generate_stream(
++                model=model,
++                prompt=encoded,
++                max_new_tokens=max_new_tokens,
++                audio_masks=audio_masks,
++                audio_parts=audio_parts,
++                decode_one_token=decode_one_token,
++                chunk_frames=STREAM_CHUNK_FRAMES,
++                temperature=temperature,
++                top_p=top_p,
++                repetition_penalty=repetition_penalty,
++            ):
++                assert (codes >= 0).all(), f"Negative code found: {codes}"
++                total_streamed += codes.size(1)
++                yield GenerateResponse(
++                    action="sample", codes=codes, text=text, partial=True
++                )
++
++            t = time.perf_counter() - t0
++            logger.info(
++                f"Streamed {total_streamed} tokens in {t:.02f} seconds, "
++                f"{total_streamed / max(t, 1e-6):.02f} tokens/sec"
++            )
++            yield GenerateResponse(action="next")
++            continue
++
+         y = generate(
+             model=model,
+             prompt=encoded,
