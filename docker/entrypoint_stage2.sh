@@ -170,16 +170,24 @@ set -e
 # --- 4. Prepare directories ---
 mkdir -p /app/references /app/avatars /var/log/supervisor
 
-# --- 4.5. Ensure libcuda.so symlink for torch.compile/Triton ---
-# The runtime image has libcuda.so.1 (from NVIDIA container toolkit) but
-# Triton's gcc link step needs plain libcuda.so in the linker search path.
-if [ ! -e /usr/lib/x86_64-linux-gnu/libcuda.so ]; then
-    if [ -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 ]; then
-        ln -s /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so
-    elif [ -e /usr/local/cuda/lib64/stubs/libcuda.so ]; then
-        ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so
+# --- 4.5. Repair the driver loader path ---
+# Some Vast hosts mount only the versioned libcuda without the .so.1 alias;
+# the loader then picks the image's CUDA forward-compat lib, which fails on
+# GeForce with Error 804. Alias the real driver, disable compat, never stubs.
+LIBDIR=/usr/lib/x86_64-linux-gnu
+if [ ! -e "$LIBDIR/libcuda.so.1" ]; then
+    VERSIONED=$(ls "$LIBDIR"/libcuda.so.* 2>/dev/null | grep -v '\.so\.1$' | head -1)
+    if [ -n "$VERSIONED" ]; then
+        ln -sf "$(basename "$VERSIONED")" "$LIBDIR/libcuda.so.1"
     fi
 fi
+if [ -e "$LIBDIR/libcuda.so.1" ] && [ ! -e "$LIBDIR/libcuda.so" ]; then
+    ln -sf libcuda.so.1 "$LIBDIR/libcuda.so"
+fi
+if [ -d /usr/local/cuda/compat ]; then
+    mv /usr/local/cuda/compat /usr/local/cuda/compat.disabled
+fi
+ldconfig
 
 # --- 5. Start all services via supervisord ---
 echo ""
