@@ -31,6 +31,7 @@ from starlette.requests import Request
 from musetalk_audio import HOLDBACK_FRAMES, append_pcm, total_frames, window_chunks
 from musetalk_avatar import AvatarData, build_avatar, load_cached_avatars
 from musetalk_models import MuseTalkModels, load_models
+from musetalk_profiling import StageTimer
 from musetalk_render import encode_jpeg, render_frames
 
 logger = logging.getLogger("avatar.face_server")
@@ -127,32 +128,41 @@ def _render_pending(
     session: AnimationSession,
     models: MuseTalkModels,
     holdback: int,
-) -> list[tuple[int, str]]:
+) -> tuple[list[tuple[int, str]], dict[str, float]]:
     """Render every frame whose audio context is complete.
 
     Returns (frame_index, base64 JPEG) pairs so reported indices stay correct
-    even when a frame is dropped.
+    even when a frame is dropped, plus per-stage timings in milliseconds.
     """
+    timer = StageTimer(models.device)
     available = max(0, total_frames(session.audio_16k) - holdback)
     if available <= session.next_frame_idx:
-        return []
+        return [], timer.rounded()
 
-    chunks, window_start = window_chunks(session.audio_16k, session.next_frame_idx, models)
+    chunks, window_start = window_chunks(
+        session.audio_16k, session.next_frame_idx, models, timer
+    )
     first = session.next_frame_idx - window_start
     last = min(available - window_start, len(chunks))
     if last <= first:
-        return []
+        return [], timer.rounded()
 
     pending = chunks[first:last]
-    rendered = render_frames(session.avatar, pending, session.next_frame_idx, models)
+    rendered = render_frames(session.avatar, pending, session.next_frame_idx, models, timer)
     session.next_frame_idx = window_start + last
 
     encoded: list[tuple[int, str]] = []
-    for frame_index, frame in rendered:
-        jpeg = encode_jpeg(frame)
-        if jpeg is not None:
-            encoded.append((frame_index, base64.b64encode(jpeg).decode("ascii")))
-    return encoded
+    with timer.stage("jpeg"):
+        for frame_index, frame in rendered:
+            jpeg = encode_jpeg(frame)
+            if jpeg is not None:
+                encoded.append((frame_index, base64.b64encode(jpeg).decode("ascii")))
+
+    logger.info(
+        "feed_profile frames=%d window_frames=%d %s",
+        len(encoded), len(chunks), timer.as_log(),
+    )
+    return encoded, timer.rounded()
 
 
 def _as_response(rendered: list[tuple[int, str]]) -> dict:
@@ -256,7 +266,7 @@ async def feed_audio(session_id: str, request: Request) -> dict:
     )
     session.touch()
 
-    rendered = await _run_on_gpu(_render_pending, session, models, HOLDBACK_FRAMES)
+    rendered, profile = await _run_on_gpu(_render_pending, session, models, HOLDBACK_FRAMES)
     session.touch()
 
     elapsed_ms = (time.monotonic() - started) * 1000
@@ -264,7 +274,11 @@ async def feed_audio(session_id: str, request: Request) -> dict:
         "Session %s: +%d bytes PCM, %d frames in %.0fms",
         session_id, len(pcm_bytes), len(rendered), elapsed_ms,
     )
-    return {**_as_response(rendered), "processing_ms": round(elapsed_ms, 1)}
+    return {
+        **_as_response(rendered),
+        "processing_ms": round(elapsed_ms, 1),
+        "profile": profile,
+    }
 
 
 @app.post("/session/{session_id}/end")
@@ -274,7 +288,7 @@ async def end_session(session_id: str) -> dict:
     session = _require_session(session_id)
 
     try:
-        rendered = await _run_on_gpu(_render_pending, session, models, 0)
+        rendered, _ = await _run_on_gpu(_render_pending, session, models, 0)
     finally:
         _sessions.pop(session_id, None)
 

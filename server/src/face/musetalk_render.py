@@ -8,6 +8,7 @@ import torch
 
 from musetalk_avatar import AvatarData
 from musetalk_models import MuseTalkModels
+from musetalk_profiling import StageTimer
 
 logger = logging.getLogger("avatar.face.render")
 
@@ -63,6 +64,7 @@ def render_frames(
     chunks: torch.Tensor,
     start_index: int,
     models: MuseTalkModels,
+    timer: StageTimer | None = None,
 ) -> list[tuple[int, np.ndarray]]:
     """Generate blended frames for a run of whisper chunks.
 
@@ -74,26 +76,31 @@ def render_frames(
     if len(chunks) == 0:
         return []
 
+    timer = timer if timer is not None else StageTimer(models.device)
     latents = _latents_for(avatar, start_index, len(chunks))
     timesteps = torch.tensor([0], device=models.device)
     frames: list[tuple[int, np.ndarray]] = []
     produced = 0
 
     for whisper_batch, latent_batch in datagen(chunks, latents, BATCH_SIZE):
-        audio_features = models.pe(whisper_batch.to(models.device, dtype=models.dtype))
-        latent_batch = latent_batch.to(device=models.device, dtype=models.unet.model.dtype)
+        with timer.stage("pe"):
+            audio_features = models.pe(whisper_batch.to(models.device, dtype=models.dtype))
+            latent_batch = latent_batch.to(device=models.device, dtype=models.unet.model.dtype)
 
         with torch.no_grad():
-            predicted = models.unet.model(
-                latent_batch, timesteps, encoder_hidden_states=audio_features
-            ).sample
-            recon = models.vae.decode_latents(predicted.to(dtype=models.vae.vae.dtype))
+            with timer.stage("unet"):
+                predicted = models.unet.model(
+                    latent_batch, timesteps, encoder_hidden_states=audio_features
+                ).sample
+            with timer.stage("vae"):
+                recon = models.vae.decode_latents(predicted.to(dtype=models.vae.vae.dtype))
 
-        for generated_face in recon:
-            frame_index = start_index + produced
-            produced += 1
-            blended = _blend_into_frame(avatar, frame_index, generated_face)
-            if blended is not None:
-                frames.append((frame_index, blended))
+        with timer.stage("blend"):
+            for generated_face in recon:
+                frame_index = start_index + produced
+                produced += 1
+                blended = _blend_into_frame(avatar, frame_index, generated_face)
+                if blended is not None:
+                    frames.append((frame_index, blended))
 
     return frames

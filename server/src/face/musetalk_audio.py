@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from musetalk_models import MuseTalkModels
+from musetalk_profiling import StageTimer
 
 logger = logging.getLogger("avatar.face.audio")
 
@@ -99,28 +100,36 @@ def _segment_features(audio_16k: np.ndarray, models: MuseTalkModels) -> list[tor
     return features
 
 
-def whisper_chunks_for(audio_16k: np.ndarray, models: MuseTalkModels) -> torch.Tensor:
+def whisper_chunks_for(
+    audio_16k: np.ndarray,
+    models: MuseTalkModels,
+    timer: StageTimer | None = None,
+) -> torch.Tensor:
     """Return one whisper feature chunk per video frame, shaped [T, 50, 384]."""
     if audio_16k.size < MIN_SAMPLES_FOR_A_FRAME:
         return torch.empty(0)
 
-    features = _segment_features(audio_16k, models)
-    return models.audio_processor.get_whisper_chunk(
-        features,
-        models.device,
-        models.dtype,
-        models.whisper,
-        len(audio_16k),
-        fps=FPS,
-        audio_padding_length_left=AUDIO_PADDING_LEFT,
-        audio_padding_length_right=AUDIO_PADDING_RIGHT,
-    )
+    timer = timer if timer is not None else StageTimer(models.device)
+    with timer.stage("whisper_mel"):
+        features = _segment_features(audio_16k, models)
+    with timer.stage("whisper_enc"):
+        return models.audio_processor.get_whisper_chunk(
+            features,
+            models.device,
+            models.dtype,
+            models.whisper,
+            len(audio_16k),
+            fps=FPS,
+            audio_padding_length_left=AUDIO_PADDING_LEFT,
+            audio_padding_length_right=AUDIO_PADDING_RIGHT,
+        )
 
 
 def window_chunks(
     audio_16k: np.ndarray,
     from_frame: int,
     models: MuseTalkModels,
+    timer: StageTimer | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Encode a bounded window ending at the newest audio.
 
@@ -129,4 +138,4 @@ def window_chunks(
     """
     window_start_frame = max(0, from_frame - LEFT_CONTEXT_FRAMES)
     window = audio_16k[window_start_frame * SAMPLES_PER_VIDEO_FRAME:]
-    return whisper_chunks_for(window, models), window_start_frame
+    return whisper_chunks_for(window, models, timer), window_start_frame
