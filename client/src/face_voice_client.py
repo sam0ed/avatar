@@ -396,9 +396,6 @@ class FaceVoiceClient:
                 stats.append("INTERRUPTED")
             print(f"\033[90m[{' | '.join(stats)}]\033[0m")
 
-            # ── Switch video back to idle ──
-            self._video_display.set_idle_mode(True)
-
             # ── Clean up audio player ──
             if player_task is not None:
                 if player_task.done():
@@ -409,6 +406,9 @@ class FaceVoiceClient:
                     await audio_queue.put(None)
                 with contextlib.suppress(Exception):
                     await player_task
+
+            # ── Switch video back to idle ──
+            self._video_display.set_idle_mode(True)
 
             # ── Clean up barge-in monitor ──
             if not barge_in_task.done():

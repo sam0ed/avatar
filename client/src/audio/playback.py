@@ -8,6 +8,7 @@ starts speaking again, and pause/resume for tentative interruptions.
 import asyncio
 import io
 import logging
+import time
 import wave
 
 import numpy as np
@@ -46,6 +47,7 @@ class AudioPlayer:
         self._paused = False
         self._written_seconds = 0.0
         self._output_latency = 0.0
+        self._t_last_write: float | None = None
         # Used to wake a blocked queue.get() when cancel() is called.
         self._cancel_event: asyncio.Event = asyncio.Event()
         # Used to wake a blocked pause wait when resume()/cancel() is called.
@@ -63,10 +65,14 @@ class AudioPlayer:
 
     @property
     def played_seconds(self) -> float | None:
-        """Audible seconds of the current turn (written minus device latency); None outside a turn."""
+        """Audible seconds of the current turn; advances with the wall clock while the device buffer drains."""
         if not self._playing:
             return None
-        return max(0.0, self._written_seconds - self._output_latency)
+        position = self._written_seconds - self._output_latency
+        if self._t_last_write is not None:
+            drained = position + (time.monotonic() - self._t_last_write)
+            position = min(self._written_seconds, drained)
+        return max(0.0, position)
 
     async def play_queue(self, queue: asyncio.Queue[bytes | None]) -> int:
         """Play audio chunks from queue until sentinel (None) or cancel.
@@ -84,6 +90,7 @@ class AudioPlayer:
         self._paused = False
         self._written_seconds = 0.0
         self._output_latency = 0.0
+        self._t_last_write = None
         self._cancel_event.clear()
         self._resume_event.clear()
         self._playing = True
@@ -173,6 +180,7 @@ class AudioPlayer:
                             None, self._stream.write, pcm[offset:end]
                         )
                         self._written_seconds += (end - offset) / bytes_per_second
+                        self._t_last_write = time.monotonic()
                         offset = end
 
                     if self._cancelled:
