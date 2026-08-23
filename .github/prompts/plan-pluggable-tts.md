@@ -84,21 +84,19 @@ wrong timebase and lip sync drifts silently:
 `server.py`'s `batch_threshold = 26460` becomes `int(engine.sample_rate * 2 * 0.3)` so the
 video feed granularity stays 0.3 s of audio at any rate.
 
-### Selection: deploy-time processes, runtime activation
+### Selection: one engine per deployment
 
-Two separate questions, answered separately:
+`TTS_ENGINE` env (default `fish`), consumed in three places: the entrypoint downloads only
+that engine's weights, supervisord's single `[program:tts]` runs `start_tts.sh` which
+dispatches on the value and execs the selected server **always on port 8080**, and the
+orchestrator calls `create_engine(TTS_ENGINE)`. An unknown value fails loudly in all
+three. Nothing else in the system knows more than one engine exists; the registry is a
+code-structure device, not runtime machinery.
 
-- **Which engine servers run** is a deploy-time decision: `TTS_ENGINES` env (comma list,
-  default `fish`). The entrypoint downloads weights and supervisord starts one program per
-  listed engine — fish on 8080, higgs on 8081. Engines not listed cost nothing.
-- **Which engine the orchestrator uses** is a runtime decision: it starts with the first
-  listed engine and `POST /tts/engine {"name": ...}` switches among the *running* ones.
-  Switching is cheap by construction — the orchestrator-side engine is a stateless HTTP
-  client plus a sample rate; the expensive part (the model server) is already up.
-
-This gives A/B within one conversation on one avatar, which is the point of the exercise,
-without any hot-loading machinery. Face sessions are started per turn and already receive
-the rate per session, so a mid-conversation switch is safe at turn boundaries.
+An idle second engine server was considered and rejected: Higgs holds its ~12–14 GiB KV
+pool whether or not it is speaking, which is too much VRAM to pay for the convenience of
+mid-conversation switching. A/B runs as it has all along — the same benchmark sentences
+and recorded wavs across two deploys, host CPU noted next to the numbers.
 
 ### Higgs specifics
 
@@ -116,22 +114,25 @@ the rate per session, so a mid-conversation switch is safe at turn boundaries.
 
 One image remains the artifact (already the pattern: isolated venvs under `/opt`). The
 Higgs venv is one more cacheable layer. Weights are never baked; the entrypoint downloads
-only the engines listed in `TTS_ENGINES`. If image size ever hurts, the two-stage
+only the engine named by `TTS_ENGINE`. If image size ever hurts, the two-stage
 base+engine split is the known escape hatch; not now.
 
-### GPU placement, engine-aware
+### GPU placement: unchanged, engine-agnostic
 
-The entrypoint's placement table gains engine weight-classes rather than hardcoded names:
+The existing placement table already encodes the right principle — the concurrent
+workloads (TTS and MuseTalk) get separated, the pipelined ones (LLM and TTS) share:
 
-| GPUs | LLM | fish (5 GiB) | higgs (~14 GiB) | MuseTalk |
-|---|---|---|---|---|
-| 1 | 0 | 0 | 0 (fits 48 GB; refuses to start both on 24 GB) | 0 |
-| 2 | 0 | 0 | 1 | 1 |
-| 3+ | 0 | 1 | 1 | 2 |
+| GPUs | LLM | TTS (any engine) | MuseTalk |
+|---|---|---|---|
+| 1 | 0 | 0 | 0 |
+| 2 | 0 | 0 | 1 |
+| 3+ | 0 | 1 | 2 |
 
-All assignments remain env-overridable (`TTS_GPU`, `HIGGS_GPU`, …). On 2×24 GB with both
-engines: GPU0 = LLM 9.1 + fish 5.1; GPU1 = MuseTalk 7.4 + Higgs with
-`--mem-fraction-static` capped to fit — measured before being trusted.
+No engine-aware machinery. VRAM per configuration: 1×48 GB fits any engine; 2×24 GB with
+Higgs puts LLM 9.1 + Higgs on GPU0, which requires capping SGLang's
+`--mem-fraction-static` to ~13 GiB — measured under a real conversation in step 5 before
+being trusted. If a future engine cannot share GPU0 with the LLM on a given card, the fix
+is the existing `TTS_GPU` override, not new policy.
 
 ## Sequencing
 
@@ -153,9 +154,8 @@ Local, no GPU: registry raises on unknown engines; every adapter satisfies `TTSE
 structurally; OpenAI adapter's request bodies (streaming, references) against a stub HTTP
 server; WAV headers parse back through `wave.open` at both rates; resample exactness.
 
-On hardware: health/warmup per engine; `/tts/engine` switch mid-conversation at a turn
-boundary; full A/V conversation per engine; sustained-delivery fps with Higgs+MuseTalk
-sharing GPU1.
+On hardware: health/warmup per engine; full A/V conversation per engine;
+sustained-delivery fps and VRAM headroom with Higgs sharing GPU0 with the LLM.
 
 ## Out of scope
 
@@ -167,7 +167,7 @@ sharing GPU1.
 
 | Risk | Mitigation |
 |---|---|
-| Higgs + MuseTalk share GPU1: contention returns for the higgs path | Measured in step 5 with the same profiling that caught it last time; 3-GPU placement is a flag away |
+| LLM + Higgs on one 24 GB card: KV-pool cap may starve Higgs throughput, or bursts may collide | Measured in step 5 with the same profiling that caught the last contention; `TTS_GPU=1` override and 3-GPU placement are one env away |
 | SGLang KV pool overshoots 24 GB alongside MuseTalk | `--mem-fraction-static` capped; VRAM measured under a real conversation before acceptance |
 | patriotyk fine-tune's serving config drifts from base Higgs assumptions | Request shape confirmed against the live server before the adapter hardens |
 | Rate plumbing missed somewhere → silent lip-sync drift | Rate travels explicitly per session; step 3 regression + step 5 24 kHz conversation are the gates |
