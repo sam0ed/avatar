@@ -17,6 +17,20 @@ export LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8001}"
 export TTS_BASE_URL="${TTS_BASE_URL:-http://localhost:8080}"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
+# GPU placement: services talk over localhost HTTP only, so placement is
+# free to vary per host. One GPU: everything shares it. Two: MuseTalk gets
+# its own (TTS<->MuseTalk contention is the measured bottleneck). Three+:
+# one each.
+GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ "$GPU_COUNT" -ge 3 ]; then
+    export LLM_GPU="${LLM_GPU:-0}" TTS_GPU="${TTS_GPU:-1}" FACE_GPU="${FACE_GPU:-2}"
+elif [ "$GPU_COUNT" -eq 2 ]; then
+    export LLM_GPU="${LLM_GPU:-0}" TTS_GPU="${TTS_GPU:-0}" FACE_GPU="${FACE_GPU:-1}"
+else
+    export LLM_GPU="${LLM_GPU:-0}" TTS_GPU="${TTS_GPU:-0}" FACE_GPU="${FACE_GPU:-0}"
+fi
+echo "GPU placement: count=${GPU_COUNT} llm=${LLM_GPU} tts=${TTS_GPU} face=${FACE_GPU}"
+
 echo "============================================="
 echo "  Avatar Stage 2 — Unified Container"
 echo "============================================="

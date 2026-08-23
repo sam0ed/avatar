@@ -85,12 +85,12 @@ def build_onstart_cmd() -> str:
     return " && ".join(steps)
 
 
-def search_offers() -> str | None:
-    """Search for cheapest RTX 4090 offer with enough disk for face models."""
+def search_offers(gpus: int) -> str | None:
+    """Search for the cheapest RTX 4090 offer with enough disk for face models."""
     result = subprocess.run(
         [
             "vastai", "search", "offers",
-            "gpu_name=RTX_4090 num_gpus=1 reliability>0.95 disk_space>=120"
+            f"gpu_name=RTX_4090 num_gpus={gpus} reliability>0.95 disk_space>=120"
             " inet_down>=700 disk_bw>=2000",
             "-o", "dph+", "--limit", "20", "--raw",
         ],
@@ -135,6 +135,12 @@ def main() -> None:
         action="store_true",
         help="Deploy with FACE_ENABLED=false (skips MuseTalk weights; isolates the audio pipeline)",
     )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=1,
+        help="GPUs per instance; the entrypoint auto-assigns services per GPU count",
+    )
     args = parser.parse_args()
 
     hf_token = get_hf_token()
@@ -143,7 +149,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- Find or use offer ---
-    offer_id = args.offer or search_offers()
+    offer_id = args.offer or search_offers(args.gpus)
     if not offer_id:
         sys.exit(1)
 
