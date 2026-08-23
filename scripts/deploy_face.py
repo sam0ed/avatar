@@ -85,7 +85,10 @@ def build_onstart_cmd() -> str:
     return " && ".join(steps)
 
 
-def search_offers(gpus: int) -> str | None:
+HIGGS_MIN_DRIVER_MAJOR = 580
+
+
+def search_offers(gpus: int, tts_engine: str = "fish") -> str | None:
     """Search for the cheapest RTX 4090 offer with enough disk for face models."""
     result = subprocess.run(
         [
@@ -106,6 +109,11 @@ def search_offers(gpus: int) -> str | None:
         o for o in offers
         if o.get("geolocation", "").split(",")[-1].strip() not in BLOCKED_REGIONS
     ]
+    if tts_engine == "higgs":
+        offers = [
+            o for o in offers
+            if int(str(o.get("driver_version", "0")).split(".")[0]) >= HIGGS_MIN_DRIVER_MAJOR
+        ]
     if not offers:
         print("No offers found (after filtering blocked regions)!", file=sys.stderr)
         return None
@@ -117,6 +125,7 @@ def search_offers(gpus: int) -> str | None:
             f"  ID {o['id']:>10}  ${o['dph_total']:.3f}/hr  "
             f"RAM={ram_gb:.0f}GB  "
             f"disk_bw={o.get('disk_bw', 0):.0f}MB/s  "
+            f"drv={o.get('driver_version', '?'):12s}  "
             f"{o.get('geolocation', 'Unknown'):20s}  "
             f"R={o.get('reliability2', 0) * 100:.0f}%"
         )
@@ -154,7 +163,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- Find or use offer ---
-    offer_id = args.offer or search_offers(args.gpus)
+    offer_id = args.offer or search_offers(args.gpus, args.tts_engine)
     if not offer_id:
         sys.exit(1)
 

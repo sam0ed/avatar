@@ -1,0 +1,15 @@
+config_cls: HiggsTtsPipelineConfig
+model_path: bosonai/higgs-tts-3-4b
+stage_overrides:
+  audio_encoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.02
+  tts_engine:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.42
+  vocoder:
+    runtime:
+      resources:
+        total_gpu_memory_fraction: 0.06

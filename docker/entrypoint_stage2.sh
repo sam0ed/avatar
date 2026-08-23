@@ -85,18 +85,26 @@ fi
 
 # --- 2. Download TTS model (only the selected engine's weights) ---
 if [ "$TTS_ENGINE" = "higgs" ]; then
+    DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+    DRV_MAJOR=${DRV%%.*}
+    if [ "$DRV_MAJOR" -lt 580 ]; then
+        echo "FATAL: driver ${DRV} < 580.65 required by the higgs stack (torch 2.11 / CUDA 13)."
+        exit 1
+    fi
     echo ""
-    echo "[2/2] Downloading TTS model: ${HIGGS_MODEL}@${HIGGS_REVISION} ..."
+    echo "[2/2] Downloading TTS model: ${HIGGS_MODEL} (expecting ${HIGGS_REVISION}) ..."
+    # Unpinned so refs/main is written (the server resolves main at start);
+    # the expected revision is asserted instead of forced.
     /opt/higgs-venv/bin/python -c "
 from huggingface_hub import snapshot_download
 import os
-snapshot_download(
-    os.environ['HIGGS_MODEL'],
-    revision=os.environ['HIGGS_REVISION'],
-    token=os.environ.get('HF_TOKEN'),
-)
-print('Higgs model download complete.')
+path = snapshot_download(os.environ['HIGGS_MODEL'], token=os.environ.get('HF_TOKEN'))
+expected = os.environ['HIGGS_REVISION']
+assert expected[:12] in path, f'weights drifted: {path} != {expected}'
+print('Higgs model download complete:', path)
 "
+    /opt/higgs-venv/bin/sgl-omni check-gpu --json --strict \
+        || echo "check-gpu reported warnings (see above) — continuing"
 else
     TTS_CHECKPOINT="/opt/fish-speech/checkpoints/openaudio-s1-mini/model.pth"
     if [ ! -f "$TTS_CHECKPOINT" ]; then

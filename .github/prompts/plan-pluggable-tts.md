@@ -142,11 +142,17 @@ and recorded wavs across two deploys, host CPU noted next to the numbers.
   loads a transformers repack of the base model — the voice the listening test picked IS
   base Higgs v3 with zero-shot cloning, which natively covers Ukrainian. Pinned by
   revision at implementation.
-- Serving: SGLang-Omni in its own venv `/opt/higgs-venv`. There is no separate supervisord
-  program: the single `[program:tts]`'s `start_tts.sh` execs
-  `/opt/higgs-venv/bin/... serve --port 8080 --mem-fraction` (derived from
-  `HIGGS_VRAM_GIB`) when `TTS_ENGINE=higgs`; low-latency (c1) configuration, since we are
-  single-user.
+- Serving: SGLang-Omni in its own venv `/opt/higgs-venv` (python 3.12 — the upstream
+  validated ABI; installed from the committed `docker/higgs-lock.txt`, since
+  `--prerelease=allow` otherwise drifts across rebuilds). There is no separate supervisord
+  program: the single `[program:tts]`'s `start_tts.sh` execs `sgl-omni serve --config
+  /app/higgs_4090.yaml` when `TTS_ENGINE=higgs`. Memory is governed by per-stage
+  `total_gpu_memory_fraction` overrides in that YAML — the defaults (0.03/0.85/0.10 of the
+  WHOLE card) would OOM beside the LLM, and `--mem-fraction-static` does not size the
+  stage budgets. The stack is CUDA-13 (torch 2.11 + cu13 kernels): hosts need driver
+  ≥ 580.65, which the deploy filter and a boot gate both enforce; prebuilt flashinfer
+  cubin/jit-cache wheels are baked so first-request JIT never runs on a box without nvcc.
+  Base-image premise corrected: it is CUDA 12.9 runtime on Ubuntu 24.04, not 12.6.
 - Cloning: profile built from `/app/references/<ref_id>/` — all `.wav`+`.lab` pairs sent
   as `references[]` with filesystem paths, which works because the SGLang server runs in
   the same container (the same assumption fish's server-side folder read already makes).
