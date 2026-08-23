@@ -98,6 +98,26 @@ pool whether or not it is speaking, which is too much VRAM to pay for the conven
 mid-conversation switching. A/B runs as it has all along — the same benchmark sentences
 and recorded wavs across two deploys, host CPU noted next to the numbers.
 
+### Deployment details (each item is a previously-paid-for lesson)
+
+- **Env forwarding through supervisord.** `supervisord.conf` `environment=` blocks
+  override inherited container env — the exact mechanism that silently pinned
+  `TTS_BASE_URL` in the first design review. Both `[program:tts]` and
+  `[program:orchestrator]` must carry `TTS_ENGINE="%(ENV_TTS_ENGINE)s"` explicitly, and
+  the entrypoint must export `TTS_ENGINE` before starting supervisord (same contract as
+  `FACE_ENABLED`).
+- **Per-engine readiness.** The entrypoint's TTS wait loop is `curl /v1/health` with a
+  60 s budget — fish-shaped twice over. SGLang serves `/health`, and a cold Higgs start
+  (weights + graph capture) runs minutes, not seconds. The wait loop and the supervisord
+  `startsecs` switch on `TTS_ENGINE`: fish `/v1/health`, 60 s; higgs `/health`, 300 s.
+- **VRAM preflight, fail at boot.** `TTS_ENGINE=higgs` + `FACE_ENABLED=true` needs
+  ~29.5 GiB (LLM 9.1 + Higgs ~13 + MuseTalk 7.4) and cannot fit one 24 GB card. The
+  entrypoint compares the selected configuration's known footprints against detected
+  VRAM and exits with an actionable message instead of letting voice cloning OOM
+  mid-conversation, which is how the 24 GB limit announced itself last time.
+- **Deploy script.** `deploy_face.py --tts-engine` passes `-e TTS_ENGINE=...`; disk stays
+  at 120 GB (Higgs weights ~10 GB fit the existing budget).
+
 ### Higgs specifics
 
 - Weights: patriotyk's Ukrainian fine-tune of `bosonai/higgs-audio-v3-tts-4b` (the model
@@ -106,7 +126,9 @@ and recorded wavs across two deploys, host CPU noted next to the numbers.
 - Serving: SGLang-Omni in its own venv `/opt/higgs-venv`, launched by supervisord as
   `program:tts-higgs`; low-latency (c1) configuration, since we are single-user.
 - Cloning: profile built from `/app/references/<ref_id>/` — all `.wav`+`.lab` pairs sent
-  as `references[]`; a missing `.lab` raises rather than silently degrading to ASR.
+  as `references[]` with filesystem paths, which works because the SGLang server runs in
+  the same container (the same assumption fish's server-side folder read already makes).
+  A missing `.lab` raises rather than silently degrading to ASR.
 - SGLang gives prefix caching (RadixAttention) and CUDA-graph serving out of the box — the
   mechanisms we hand-built for fish arrive free here, which keeps the comparison fair.
 
