@@ -14,8 +14,11 @@ export N_GPU_LAYERS="${N_GPU_LAYERS:--1}"
 export N_CTX="${N_CTX:-8192}"
 export FLASH_ATTN="${FLASH_ATTN:-true}"
 export LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8001}"
-export TTS_BASE_URL="${TTS_BASE_URL:-http://localhost:8080}"
 export HF_HUB_ENABLE_HF_TRANSFER=1
+export TTS_ENGINE="${TTS_ENGINE:-fish}"
+export HIGGS_VRAM_GIB="${HIGGS_VRAM_GIB:-13}"
+export HIGGS_MODEL="${HIGGS_MODEL:-bosonai/higgs-tts-3-4b}"
+export HIGGS_REVISION="${HIGGS_REVISION:-7556c17e05201fccd9c8cc120bc216dcc7b5d561}"
 
 # GPU placement: services talk over localhost HTTP only, so placement is
 # free to vary per host. One GPU: everything shares it. Two: MuseTalk gets
@@ -30,6 +33,27 @@ else
     export LLM_GPU="${LLM_GPU:-0}" TTS_GPU="${TTS_GPU:-0}" FACE_GPU="${FACE_GPU:-0}"
 fi
 echo "GPU placement: count=${GPU_COUNT} llm=${LLM_GPU} tts=${TTS_GPU} face=${FACE_GPU}"
+
+# VRAM preflight: sum known footprints per assigned GPU against the hardware,
+# so an impossible configuration refuses at boot instead of OOMing mid-turn.
+LLM_GIB=10
+MUSETALK_GIB=8
+if [ "$TTS_ENGINE" = "higgs" ]; then TTS_GIB="$HIGGS_VRAM_GIB"; else TTS_GIB=6; fi
+for GPU_IDX in $(seq 0 $((GPU_COUNT - 1))); do
+    NEED=0
+    [ "$LLM_GPU" = "$GPU_IDX" ] && NEED=$((NEED + LLM_GIB))
+    [ "$TTS_GPU" = "$GPU_IDX" ] && NEED=$((NEED + TTS_GIB))
+    if [ "${FACE_ENABLED:-false}" = "true" ] && [ "$FACE_GPU" = "$GPU_IDX" ]; then
+        NEED=$((NEED + MUSETALK_GIB))
+    fi
+    HAVE_MIB=$(nvidia-smi -i "$GPU_IDX" --query-gpu=memory.total --format=csv,noheader,nounits)
+    HAVE=$((HAVE_MIB / 1024))
+    if [ "$NEED" -gt "$HAVE" ]; then
+        echo "FATAL: GPU $GPU_IDX needs ~${NEED} GiB (llm=${LLM_GIB}, tts[$TTS_ENGINE]=${TTS_GIB}, face=${MUSETALK_GIB}) but has ${HAVE} GiB."
+        echo "       Use more/larger GPUs, or override LLM_GPU/TTS_GPU/FACE_GPU/HIGGS_VRAM_GIB."
+        exit 1
+    fi
+done
 
 echo "============================================="
 echo "  Avatar Stage 2 — Unified Container"
@@ -59,12 +83,26 @@ else
     echo "[1/2] LLM model already cached at ${MODEL_PATH}"
 fi
 
-# --- 2. Download TTS model ---
-TTS_CHECKPOINT="/opt/fish-speech/checkpoints/openaudio-s1-mini/model.pth"
-if [ ! -f "$TTS_CHECKPOINT" ]; then
+# --- 2. Download TTS model (only the selected engine's weights) ---
+if [ "$TTS_ENGINE" = "higgs" ]; then
     echo ""
-    echo "[2/2] Downloading TTS model: openaudio-s1-mini ..."
-    /opt/fish-speech/.venv/bin/python -c "
+    echo "[2/2] Downloading TTS model: ${HIGGS_MODEL}@${HIGGS_REVISION} ..."
+    /opt/higgs-venv/bin/python -c "
+from huggingface_hub import snapshot_download
+import os
+snapshot_download(
+    os.environ['HIGGS_MODEL'],
+    revision=os.environ['HIGGS_REVISION'],
+    token=os.environ.get('HF_TOKEN'),
+)
+print('Higgs model download complete.')
+"
+else
+    TTS_CHECKPOINT="/opt/fish-speech/checkpoints/openaudio-s1-mini/model.pth"
+    if [ ! -f "$TTS_CHECKPOINT" ]; then
+        echo ""
+        echo "[2/2] Downloading TTS model: openaudio-s1-mini ..."
+        /opt/fish-speech/.venv/bin/python -c "
 from huggingface_hub import snapshot_download
 import os
 snapshot_download(
@@ -74,8 +112,9 @@ snapshot_download(
 )
 print('TTS model download complete.')
 "
-else
-    echo "[2/2] TTS model already cached at ${TTS_CHECKPOINT}"
+    else
+        echo "[2/2] TTS model already cached at ${TTS_CHECKPOINT}"
+    fi
 fi
 
 # --- 3. MuseTalk venv + models ---
@@ -196,21 +235,35 @@ echo "Starting services via supervisord ..."
 
 # --- 6. Warmup TTS (torch.compile first-request penalty ~30-60s) ---
 echo ""
-echo "Waiting for TTS server to be ready ..."
-for i in $(seq 1 60); do
-    if curl -sf http://localhost:8080/v1/health > /dev/null 2>&1; then
+if [ "$TTS_ENGINE" = "higgs" ]; then
+    TTS_HEALTH_PATH="/health"
+    TTS_WAIT_S=300
+else
+    TTS_HEALTH_PATH="/v1/health"
+    TTS_WAIT_S=60
+fi
+echo "Waiting for TTS server ($TTS_ENGINE) to be ready ..."
+for i in $(seq 1 "$TTS_WAIT_S"); do
+    if curl -sf "http://localhost:8080${TTS_HEALTH_PATH}" > /dev/null 2>&1; then
         echo "TTS health OK after ${i}s"
         break
     fi
     sleep 1
 done
 
-echo "Sending TTS warmup request (torch.compile will trace on first call) ..."
+echo "Sending TTS warmup request ..."
 WARMUP_START=$(date +%s)
-curl -sf -X POST http://localhost:8080/v1/tts \
-    -H 'Content-Type: application/json' \
-    -d '{"text": "Hello world.", "streaming": false}' \
-    -o /dev/null || echo "Warmup request failed (non-fatal)"
+if [ "$TTS_ENGINE" = "higgs" ]; then
+    curl -sf -X POST http://localhost:8080/v1/audio/speech \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\": \"${HIGGS_MODEL}\", \"input\": \"Hello world.\", \"voice\": \"default\", \"response_format\": \"pcm\", \"stream\": false}" \
+        -o /dev/null || echo "Warmup request failed (non-fatal)"
+else
+    curl -sf -X POST http://localhost:8080/v1/tts \
+        -H 'Content-Type: application/json' \
+        -d '{"text": "Hello world.", "streaming": false}' \
+        -o /dev/null || echo "Warmup request failed (non-fatal)"
+fi
 WARMUP_END=$(date +%s)
 echo "TTS warmup completed in $((WARMUP_END - WARMUP_START))s"
 

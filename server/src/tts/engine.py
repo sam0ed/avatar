@@ -47,10 +47,23 @@ class EngineSpec:
     factory: Callable[[], TTSEngine]
 
 
+HIGGS_MODEL = os.environ.get("HIGGS_MODEL", "bosonai/higgs-tts-3-4b")
+
+
 def _fish_factory() -> TTSEngine:
     from src.tts.engine_fish_speech import FishSpeechEngine
 
     return FishSpeechEngine()
+
+
+def _higgs_factory() -> TTSEngine:
+    from src.tts.engine_openai_audio import OpenAIAudioEngine
+
+    return OpenAIAudioEngine(
+        base_url=ENGINES["higgs"].base_url,
+        sample_rate=ENGINES["higgs"].sample_rate,
+        model=HIGGS_MODEL,
+    )
 
 
 ENGINES: dict[str, EngineSpec] = {
@@ -59,6 +72,12 @@ ENGINES: dict[str, EngineSpec] = {
         sample_rate=44100,
         base_url="http://localhost:8080",
         factory=_fish_factory,
+    ),
+    "higgs": EngineSpec(
+        name="higgs",
+        sample_rate=24000,
+        base_url="http://localhost:8080",
+        factory=_higgs_factory,
     ),
 }
 

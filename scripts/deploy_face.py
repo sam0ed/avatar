@@ -72,8 +72,8 @@ def build_onstart_cmd() -> str:
         f"git clone --depth 1 {GITHUB_REPO} /tmp/av",
         # 2. Copy configs + code
         "cp /tmp/av/docker/supervisord.conf /etc/supervisor/conf.d/avatar.conf"
-        " && cp /tmp/av/docker/entrypoint_stage2.sh /app/"
-        " && chmod +x /app/entrypoint_stage2.sh"
+        " && cp /tmp/av/docker/entrypoint_stage2.sh /tmp/av/docker/start_tts.sh /app/"
+        " && chmod +x /app/entrypoint_stage2.sh /app/start_tts.sh"
         " && mkdir -p /app/orchestrator"
         " && cp -r /tmp/av/server/src /app/orchestrator/"
         " && cp /tmp/av/server/pyproject.toml /app/orchestrator/",
@@ -141,6 +141,11 @@ def main() -> None:
         default=1,
         help="GPUs per instance; the entrypoint auto-assigns services per GPU count",
     )
+    parser.add_argument(
+        "--tts-engine",
+        default="fish",
+        help="TTS engine to deploy (fish | higgs); weights and server are selected at boot",
+    )
     args = parser.parse_args()
 
     hf_token = get_hf_token()
@@ -159,6 +164,7 @@ def main() -> None:
     env_flags = (
         f"-e HF_TOKEN={hf_token}"
         f" -e FACE_ENABLED={face_enabled}"
+        f" -e TTS_ENGINE={args.tts_engine}"
         " -p 8000:8000 -p 8001:8001 -p 8080:8080 -p 8002:8002"
     )
 
