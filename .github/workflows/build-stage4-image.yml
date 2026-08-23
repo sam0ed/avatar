@@ -8,6 +8,11 @@ on:
       - docker/patches/**
       - .github/workflows/build-stage4-image.yml
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "Build without the GHA layer cache (recovers from evicted-blob corruption)"
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -54,6 +59,7 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          no-cache: ${{ github.event_name == 'workflow_dispatch' && inputs.no_cache }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
