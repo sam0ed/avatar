@@ -63,7 +63,7 @@ RUN /opt/musetalk-venv/bin/python -c "import numpy, cv2; print('numpy', numpy.__
     && /opt/musetalk-venv/bin/python -c "from diffusers import AutoencoderKL; print('diffusers OK')"
 
 COPY docker/higgs-lock.txt /tmp/higgs-lock.txt
-RUN python3.12 -m venv /opt/higgs-venv \
+RUN uv venv --python 3.12 /opt/higgs-venv \
     && UV_NO_CACHE=1 VIRTUAL_ENV=/opt/higgs-venv uv pip install --prerelease=allow \
         -r /tmp/higgs-lock.txt \
     && UV_NO_CACHE=1 VIRTUAL_ENV=/opt/higgs-venv uv pip install \
