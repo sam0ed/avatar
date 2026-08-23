@@ -16,12 +16,13 @@ two properties the naive whole-buffer approach lacked:
     is never recomputed. Re-encoding the whole buffer meant whisper's global
     attention silently changed features for frames already sent.
 
-Incoming PCM is resampled on exact 441-sample boundaries (44100:16000 reduces to
-441:160), so the accumulated 16 kHz signal is sample-identical to resampling the
-whole buffer at once and no chunk boundary introduces an artefact.
+Incoming PCM is resampled on exact group boundaries derived from the source rate
+(rate // gcd(rate, 16000): 441 samples at 44100 Hz, 3 at 24000 Hz), so every group
+maps to a whole number of 16 kHz samples and no chunk boundary drifts.
 """
 
 import logging
+import math
 
 import numpy as np
 import torch
@@ -39,8 +40,14 @@ AUDIO_PADDING_LEFT = 2
 AUDIO_PADDING_RIGHT = 2
 
 SAMPLES_PER_VIDEO_FRAME = WHISPER_SAMPLE_RATE // FPS
-RESAMPLE_GROUP_IN = 441
 LEFT_CONTEXT_FRAMES = 50
+
+
+def resample_group(source_rate: int) -> int:
+    """Smallest input-sample group that maps to a whole number of 16 kHz samples."""
+    if source_rate <= 0:
+        raise ValueError(f"Invalid source sample rate: {source_rate}")
+    return source_rate // math.gcd(source_rate, WHISPER_SAMPLE_RATE)
 
 HOLDBACK_FRAMES = AUDIO_PADDING_RIGHT
 MIN_SAMPLES_FOR_A_FRAME = SAMPLES_PER_VIDEO_FRAME
@@ -52,14 +59,14 @@ def pcm_to_float32(pcm_bytes: bytes) -> np.ndarray:
     return samples.astype(np.float32) / 32768.0
 
 
-def resample_for_whisper(audio: np.ndarray) -> np.ndarray:
+def resample_for_whisper(audio: np.ndarray, source_rate: int = PCM_SAMPLE_RATE) -> np.ndarray:
     """Resample TTS-rate audio down to whisper's 16 kHz."""
     import librosa
 
     if audio.size == 0:
         return audio
     return librosa.resample(
-        audio, orig_sr=PCM_SAMPLE_RATE, target_sr=WHISPER_SAMPLE_RATE
+        audio, orig_sr=source_rate, target_sr=WHISPER_SAMPLE_RATE
     )
 
 
@@ -67,16 +74,18 @@ def append_pcm(
     audio_16k: np.ndarray,
     remainder: bytes,
     pcm_bytes: bytes,
+    source_rate: int = PCM_SAMPLE_RATE,
 ) -> tuple[np.ndarray, bytes]:
     """Resample and append new PCM, returning the buffer and unused tail bytes."""
+    group = resample_group(source_rate)
     buffered = remainder + pcm_bytes
     total_samples = len(buffered) // 2
-    usable_samples = (total_samples // RESAMPLE_GROUP_IN) * RESAMPLE_GROUP_IN
+    usable_samples = (total_samples // group) * group
     if usable_samples == 0:
         return audio_16k, buffered
 
     split = usable_samples * 2
-    resampled = resample_for_whisper(pcm_to_float32(buffered[:split]))
+    resampled = resample_for_whisper(pcm_to_float32(buffered[:split]), source_rate)
     return np.concatenate([audio_16k, resampled]), buffered[split:]
 
 

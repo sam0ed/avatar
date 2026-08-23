@@ -69,6 +69,7 @@ class AnimationSession:
 
     session_id: str
     avatar: AvatarData = field(repr=False)
+    sample_rate: int = PCM_SAMPLE_RATE
     audio_16k: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.float32), repr=False
     )
@@ -95,10 +96,10 @@ async def _sweep_idle_sessions() -> None:
 def _warm_render_path(models: MuseTalkModels, avatar: AvatarData) -> None:
     """Render 1s of silence once so lazy imports and cuDNN autotune (~17s) are paid at startup, not on the first turn."""
     global _render_warmed
-    session = AnimationSession(session_id="warmup", avatar=avatar)
+    session = AnimationSession(session_id="warmup", avatar=avatar, sample_rate=PCM_SAMPLE_RATE)
     silence = b"\x00" * (PCM_SAMPLE_RATE * 2)
     session.audio_16k, session.pcm_remainder = append_pcm(
-        session.audio_16k, session.pcm_remainder, silence
+        session.audio_16k, session.pcm_remainder, silence, session.sample_rate
     )
     started = time.monotonic()
     rendered, profile = _render_pending(session, models, HOLDBACK_FRAMES)
@@ -260,8 +261,13 @@ async def prepare_avatar(
 
 
 @app.post("/session/start")
-async def start_session(avatar_id: str = Form("default")) -> dict:
-    """Open a streaming animation session against a prepared avatar."""
+async def start_session(
+    avatar_id: str = Form("default"),
+    sample_rate: int = Form(PCM_SAMPLE_RATE),
+) -> dict:
+    """Open a streaming animation session fed with PCM at sample_rate."""
+    if sample_rate <= 0:
+        raise HTTPException(status_code=400, detail=f"Invalid sample_rate: {sample_rate}")
     avatar = _avatars.get(avatar_id)
     if avatar is None:
         raise HTTPException(
@@ -274,14 +280,16 @@ async def start_session(avatar_id: str = Form("default")) -> dict:
         )
 
     session_id = str(uuid.uuid4())
-    _sessions[session_id] = AnimationSession(session_id=session_id, avatar=avatar)
+    _sessions[session_id] = AnimationSession(
+        session_id=session_id, avatar=avatar, sample_rate=sample_rate
+    )
     logger.info("Session %s started for avatar '%s'", session_id, avatar_id)
     return {"session_id": session_id, "avatar_id": avatar_id}
 
 
 @app.post("/session/{session_id}/feed")
 async def feed_audio(session_id: str, request: Request) -> dict:
-    """Accept raw PCM (44100 Hz, mono, int16 LE) and return new frames."""
+    """Accept raw PCM (mono int16 LE at the session's sample rate) and return new frames."""
     models = _require_models()
     session = _require_session(session_id)
 
@@ -291,7 +299,7 @@ async def feed_audio(session_id: str, request: Request) -> dict:
 
     started = time.monotonic()
     session.audio_16k, session.pcm_remainder = append_pcm(
-        session.audio_16k, session.pcm_remainder, pcm_bytes
+        session.audio_16k, session.pcm_remainder, pcm_bytes, session.sample_rate
     )
     session.touch()
 

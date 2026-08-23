@@ -88,18 +88,11 @@ class FaceAnimationClient:
         )
         return result
 
-    async def start_session(self, avatar_id: str = "default") -> str:
-        """Start a new streaming animation session.
-
-        Args:
-            avatar_id: Which prepared avatar to use.
-
-        Returns:
-            Session ID string.
-        """
+    async def start_session(self, avatar_id: str = "default", sample_rate: int = 44100) -> str:
+        """Start a streaming animation session fed with PCM at the given sample rate."""
         resp = await self._http.post(
             f"{self.base_url}/session/start",
-            data={"avatar_id": avatar_id},
+            data={"avatar_id": avatar_id, "sample_rate": str(sample_rate)},
         )
         resp.raise_for_status()
         session_id = resp.json()["session_id"]
@@ -111,7 +104,7 @@ class FaceAnimationClient:
 
         Args:
             session_id: Active session ID.
-            pcm_chunk: Raw PCM audio (44100Hz, mono, int16 LE).
+            pcm_chunk: Raw PCM audio (mono int16 LE at the session's sample rate).
 
         Returns:
             List of JPEG frame bytes (may be empty if not enough audio yet).

@@ -401,7 +401,9 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     if FACE_ENABLED and face_client is not None and _active_avatar_id is not None:
         video_pcm_queue = asyncio.Queue()
         try:
-            face_session_id = await face_client.start_session(_active_avatar_id)
+            face_session_id = await face_client.start_session(
+                _active_avatar_id, sample_rate=tts_client.sample_rate
+            )
         except Exception:
             logger.warning("Failed to start face session, continuing audio-only")
             video_pcm_queue = None
