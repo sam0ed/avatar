@@ -91,7 +91,9 @@ class FaceVoiceClient:
         self._ws: ClientConnection | None = None
         self._transcriber = SpeechTranscriber(language=language, device=device)
         self._player = AudioPlayer()
-        self._video_display = VideoDisplay()
+        self._video_display = VideoDisplay(
+            audio_position=lambda: self._player.played_seconds
+        )
         self._running = False
         self._use_smart_turn = use_smart_turn
         self._smart_turn = None  # SmartTurnAnalyzer, initialized in run()
@@ -333,7 +335,11 @@ class FaceVoiceClient:
                     elif msg_type == "chat_video":
                         frame = response.get("frame")
                         if frame:
-                            self._video_display.show_frame(frame)
+                            self._video_display.show_frame(
+                                frame,
+                                response.get("frame_idx", 0),
+                                response.get("fps", 25),
+                            )
 
                     elif msg_type == "chat_done":
                         print()  # newline after streaming tokens

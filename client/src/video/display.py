@@ -1,19 +1,14 @@
-"""Video display with OpenCV window for face animation frames.
+"""OpenCV window for face frames, paced by the audio playback position.
 
-Renders JPEG frames received from the server via chat_video messages.
-Uses a dedicated thread for cv2.imshow (OpenCV requires the main thread
-or a dedicated thread for GUI updates on Windows).
-
-Supports:
-  - Live frames: show_frame(jpeg_bytes) for real-time animation
-  - Idle mode: cycle through reference frames at ~5 FPS when not speaking
-  - Start/stop lifecycle matching AudioPlayer pattern
+Frame i of a turn belongs to audio second i/fps: the display shows the frame
+matching what is currently audible, drops late frames, holds when ahead.
 """
 
 import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 import cv2
 import numpy as np
@@ -23,21 +18,19 @@ logger = logging.getLogger("avatar.video")
 _IDLE_FPS = 5
 _IDLE_INTERVAL = 1.0 / _IDLE_FPS
 
-_LIVE_FPS = 25
-_LIVE_INTERVAL = 1.0 / _LIVE_FPS
+_DEFAULT_LIVE_FPS = 25
+_FRAME_BUFFER_MAX = 300
 
 _WINDOW_NAME = "Avatar"
 
 
 class VideoDisplay:
-    """Thread-based OpenCV window for displaying avatar video frames.
+    """Thread-based OpenCV window; live pacing follows audio_position()."""
 
-    Frames are pushed via show_frame() from the async message handler.
-    A dedicated thread runs the cv2 event loop and renders frames.
-    """
-
-    def __init__(self) -> None:
-        self._frame_buffer: deque[np.ndarray] = deque(maxlen=60)
+    def __init__(self, audio_position: Callable[[], float | None] | None = None) -> None:
+        self._audio_position = audio_position
+        self._frame_buffer: deque[tuple[int, bytes]] = deque(maxlen=_FRAME_BUFFER_MAX)
+        self._live_fps: int = _DEFAULT_LIVE_FPS
         self._idle_frames: list[np.ndarray] = []
         self._idle_idx: int = 0
         self._current_frame: np.ndarray | None = None
@@ -63,13 +56,12 @@ class VideoDisplay:
             self._thread = None
         logger.info("VideoDisplay stopped")
 
-    def show_frame(self, jpeg_bytes: bytes) -> None:
-        """Decode and enqueue a JPEG frame for display."""
-        frame = self._decode_jpeg(jpeg_bytes)
-        if frame is not None:
-            with self._lock:
-                self._frame_buffer.append(frame)
-                self._idle_mode = False
+    def show_frame(self, jpeg_bytes: bytes, frame_idx: int, fps: int = _DEFAULT_LIVE_FPS) -> None:
+        """Enqueue a JPEG frame under its per-turn index."""
+        with self._lock:
+            self._frame_buffer.append((frame_idx, jpeg_bytes))
+            self._live_fps = fps or _DEFAULT_LIVE_FPS
+            self._idle_mode = False
 
     def set_idle_frames(self, frames: list[bytes]) -> None:
         """Set reference frames for idle animation (JPEG bytes)."""
@@ -90,11 +82,20 @@ class VideoDisplay:
             if enabled:
                 self._frame_buffer.clear()
 
-    def advance_frame(self) -> None:
-        """Advance to the next buffered frame (called by audio timing)."""
+    def _due_frame(self) -> np.ndarray | None:
+        """Newest frame due at the current audio position; None = hold."""
+        position = self._audio_position() if self._audio_position else None
+        if position is None:
+            return None
+
+        due_jpeg: bytes | None = None
         with self._lock:
-            if self._frame_buffer:
-                self._current_frame = self._frame_buffer.popleft()
+            target_idx = int(position * self._live_fps)
+            while self._frame_buffer and self._frame_buffer[0][0] <= target_idx:
+                _, due_jpeg = self._frame_buffer.popleft()
+        if due_jpeg is None:
+            return None
+        return self._decode_jpeg(due_jpeg)
 
     @property
     def buffer_size(self) -> int:
@@ -113,7 +114,6 @@ class VideoDisplay:
         """Main display thread loop — renders frames via cv2.imshow."""
         cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_NORMAL)
         last_idle_time = 0.0
-        last_live_time = 0.0
 
         while self._running:
             now = time.monotonic()
@@ -126,9 +126,11 @@ class VideoDisplay:
                         self._current_frame = self._idle_frames[self._idle_idx]
                         self._idle_idx = (self._idle_idx + 1) % len(self._idle_frames)
                     last_idle_time = now
-            elif now - last_live_time >= _LIVE_INTERVAL:
-                self.advance_frame()
-                last_live_time = now
+            else:
+                due = self._due_frame()
+                if due is not None:
+                    with self._lock:
+                        self._current_frame = due
 
             with self._lock:
                 frame = self._current_frame

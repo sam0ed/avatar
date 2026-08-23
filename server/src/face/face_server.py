@@ -93,14 +93,7 @@ async def _sweep_idle_sessions() -> None:
 
 
 def _warm_render_path(models: MuseTalkModels, avatar: AvatarData) -> None:
-    """Render one second of silence through the real feed path, once.
-
-    The first feed of a cold process pays for lazy imports (librosa, MuseTalk's
-    datagen and blending helpers) and cuDNN autotuning of the UNet/VAE shapes —
-    measured at ~17s on an A6000, all of which landed on the first conversation
-    turn. Paying it at startup instead makes the first real feed a steady-state
-    feed.
-    """
+    """Render 1s of silence once so lazy imports and cuDNN autotune (~17s) are paid at startup, not on the first turn."""
     global _render_warmed
     session = AnimationSession(session_id="warmup", avatar=avatar)
     silence = b"\x00" * (PCM_SAMPLE_RATE * 2)

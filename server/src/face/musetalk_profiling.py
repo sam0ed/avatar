@@ -1,12 +1,4 @@
-"""Per-stage wall-clock attribution for the render path.
-
-Stage boundaries synchronise CUDA before and after timing. Without that,
-kernel launches are asynchronous and their cost lands on whichever later
-stage first blocks on the GPU (usually the `.cpu()` copy inside VAE decode),
-which misattributes almost everything. The syncs serialise work the driver
-could overlap, so the numbers answer "where does the time go" — the per-feed
-total remains the authoritative throughput figure.
-"""
+"""Per-stage wall-clock attribution; CUDA-synced boundaries so async kernel cost lands on the launching stage."""
 
 import time
 from contextlib import contextmanager

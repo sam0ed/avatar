@@ -44,6 +44,8 @@ class AudioPlayer:
         self._cancelled = False
         self._playing = False
         self._paused = False
+        self._written_seconds = 0.0
+        self._output_latency = 0.0
         # Used to wake a blocked queue.get() when cancel() is called.
         self._cancel_event: asyncio.Event = asyncio.Event()
         # Used to wake a blocked pause wait when resume()/cancel() is called.
@@ -59,6 +61,13 @@ class AudioPlayer:
         """Whether playback is currently paused."""
         return self._paused
 
+    @property
+    def played_seconds(self) -> float | None:
+        """Audible seconds of the current turn (written minus device latency); None outside a turn."""
+        if not self._playing:
+            return None
+        return max(0.0, self._written_seconds - self._output_latency)
+
     async def play_queue(self, queue: asyncio.Queue[bytes | None]) -> int:
         """Play audio chunks from queue until sentinel (None) or cancel.
 
@@ -73,6 +82,8 @@ class AudioPlayer:
         """
         self._cancelled = False
         self._paused = False
+        self._written_seconds = 0.0
+        self._output_latency = 0.0
         self._cancel_event.clear()
         self._resume_event.clear()
         self._playing = True
@@ -108,8 +119,10 @@ class AudioPlayer:
                                 dtype="int16",
                             )
                             self._stream.start()
+                            self._output_latency = float(self._stream.latency or 0.0)
                         pcm = wf.readframes(wf.getnframes())
                         channels = wf.getnchannels()
+                        bytes_per_second = wf.getframerate() * channels * 2
 
                     # Write PCM in small frames for responsive pause/resume.
                     # Checking _paused every ~40 ms lets us stop feeding
@@ -159,6 +172,7 @@ class AudioPlayer:
                         await loop.run_in_executor(
                             None, self._stream.write, pcm[offset:end]
                         )
+                        self._written_seconds += (end - offset) / bytes_per_second
                         offset = end
 
                     if self._cancelled:
