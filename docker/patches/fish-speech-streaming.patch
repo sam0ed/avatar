@@ -37,10 +37,10 @@ index f54de5b..e392c01 100644
                  if req.streaming:  # Used only by the API server
                      yield InferenceResult(
 diff --git a/fish_speech/models/text2semantic/inference.py b/fish_speech/models/text2semantic/inference.py
-index d940be4..7c3c384 100644
+index d940be4..3ae4e3b 100644
 --- a/fish_speech/models/text2semantic/inference.py
 +++ b/fish_speech/models/text2semantic/inference.py
-@@ -388,6 +388,131 @@ class GenerateResponse:
+@@ -388,6 +388,162 @@ class GenerateResponse:
      action: Literal["sample", "next"]
      codes: Optional[torch.Tensor] = None
      text: Optional[str] = None
@@ -104,16 +104,47 @@ index d940be4..7c3c384 100644
 +        dtype=torch.float,
 +    )
 +
++    prompt_flat = prompt.view(1, codebook_dim, -1)
++    reuse_len = 0
++    cached_prefix = getattr(model, "_kv_prefix_ids", None)
++    if (
++        cached_prefix is not None
++        and audio_masks is None
++        and audio_parts is None
++    ):
++        limit = min(cached_prefix.size(2), T - 1)
++        if limit > 0:
++            mismatches = (
++                (prompt_flat[:, :, :limit] != cached_prefix[:, :, :limit])
++                .any(dim=1)
++                .squeeze(0)
++                .nonzero()
++            )
++            lcp = int(mismatches[0].item()) if mismatches.numel() else limit
++            if lcp >= 256:
++                reuse_len = lcp
++
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++    prefill_started = time.perf_counter()
 +    first_token = decode_one_token_ar(
 +        model,
-+        prompt.view(1, codebook_dim, -1),
-+        input_pos,
++        prompt_flat[:, :, reuse_len:],
++        torch.arange(reuse_len, T, device=device, dtype=torch.long),
 +        temperature,
 +        top_p,
 +        repetition_penalty,
 +        audio_masks,
 +        audio_parts,
 +    )
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++    logger.info(
++        f"Prefill: {T - reuse_len} of {T} tokens in "
++        f"{time.perf_counter() - prefill_started:.3f}s (kv prefix reused: {reuse_len})"
++    )
++    if audio_masks is None and audio_parts is None:
++        model._kv_prefix_ids = prompt_flat.clone()
 +
 +    input_pos = torch.tensor([T], device=device, dtype=torch.int)
 +    previous_tokens = torch.zeros(
@@ -172,7 +203,7 @@ index d940be4..7c3c384 100644
  
  
  def generate_long(
-@@ -466,6 +591,34 @@ def generate_long(
+@@ -466,6 +622,34 @@ def generate_long(
  
          t0 = time.perf_counter()
  
