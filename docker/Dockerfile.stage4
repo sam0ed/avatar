@@ -73,7 +73,17 @@ RUN uv venv --python 3.12 /opt/higgs-venv \
 
 ENV FLASHINFER_WORKSPACE_BASE=/root
 
+# SGLang JIT-compiles a few kernels (QK-Norm, fused RoPE) via tvm_ffi at first
+# boot; the cu13 wheel ships libcudart.so.13 in lib/ but the linker needs the
+# unversioned name and tvm_ffi searches $CUDA_HOME/lib64.
+RUN CU13=/opt/higgs-venv/lib/python3.12/site-packages/nvidia/cu13 \
+    && ln -sf libcudart.so.13 $CU13/lib/libcudart.so \
+    && ln -sfn lib $CU13/lib64
+
 RUN test -x /opt/higgs-venv/bin/sgl-omni \
+    && test -x /opt/higgs-venv/bin/ninja \
+    && test -x /opt/higgs-venv/lib/python3.12/site-packages/nvidia/cu13/bin/nvcc \
+    && test -e /opt/higgs-venv/lib/python3.12/site-packages/nvidia/cu13/lib64/libcudart.so \
     && /opt/higgs-venv/bin/python -c "import huggingface_hub, hf_transfer, flashinfer; print('higgs venv OK')"
 
 RUN mkdir -p /app/references /app/avatars /var/log/supervisor /models \

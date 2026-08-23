@@ -72,7 +72,7 @@ def build_onstart_cmd() -> str:
         f"git clone --depth 1 {GITHUB_REPO} /tmp/av",
         # 2. Copy configs + code
         "cp /tmp/av/docker/supervisord.conf /etc/supervisor/conf.d/avatar.conf"
-        " && cp /tmp/av/docker/entrypoint_stage2.sh /tmp/av/docker/start_tts.sh /app/"
+        " && cp /tmp/av/docker/entrypoint_stage2.sh /tmp/av/docker/start_tts.sh /tmp/av/docker/higgs_4090.yaml /app/"
         " && chmod +x /app/entrypoint_stage2.sh /app/start_tts.sh"
         " && mkdir -p /app/orchestrator"
         " && cp -r /tmp/av/server/src /app/orchestrator/"
