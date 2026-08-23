@@ -136,9 +136,12 @@ and recorded wavs across two deploys, host CPU noted next to the numbers.
 
 ### Higgs specifics
 
-- Weights: patriotyk's Ukrainian fine-tune of `bosonai/higgs-audio-v3-tts-4b` (the model
-  behind the HF space the listening test picked; exact repo id read off that space at
-  implementation time and pinned by revision).
+- Weights: **base** `bosonai/higgs-tts-3-4b` (upstream renamed from
+  `higgs-audio-v3-tts-4b`; 9.31 GiB safetensors, verified via the HF API). The
+  "patriotyk fine-tune" assumption was checked and was wrong: his HF space's `app.py`
+  loads a transformers repack of the base model — the voice the listening test picked IS
+  base Higgs v3 with zero-shot cloning, which natively covers Ukrainian. Pinned by
+  revision at implementation.
 - Serving: SGLang-Omni in its own venv `/opt/higgs-venv`. There is no separate supervisord
   program: the single `[program:tts]`'s `start_tts.sh` execs
   `/opt/higgs-venv/bin/... serve --port 8080 --mem-fraction` (derived from
@@ -212,6 +215,6 @@ sustained-delivery fps and VRAM headroom with Higgs sharing GPU0 with the LLM.
 |---|---|
 | LLM + Higgs on one 24 GB card: KV-pool cap may starve Higgs throughput, or bursts may collide | Measured in step 5 with the same profiling that caught the last contention; `TTS_GPU=1` override and 3-GPU placement are one env away |
 | SGLang KV pool overshoots 24 GB alongside MuseTalk | `--mem-fraction-static` capped; VRAM measured under a real conversation before acceptance |
-| patriotyk fine-tune's serving config drifts from base Higgs assumptions | Request shape confirmed against the live server before the adapter hardens |
+| Upstream renamed the weights repo once already (`higgs-audio-v3-tts-4b` → `higgs-tts-3-4b`) — mutable-name drift, the fish lesson | Pin by revision hash, not by name; request shape confirmed against the live server before the adapter hardens |
 | Rate plumbing missed somewhere → silent lip-sync drift | Rate travels explicitly per session; step 3 regression + step 5 24 kHz conversation are the gates |
 | Host-CPU lottery skews the bake-off | Both engines benched on the same instance; host CPU recorded in AGENTS.md with the numbers |
