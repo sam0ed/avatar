@@ -1,17 +1,26 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "structlog>=24",
+# ]
+# ///
 """Per-stage MuseTalk throughput profile, run on the server over localhost.
 
 Feeds silent PCM in orchestrator-sized chunks and aggregates the per-stage
-timings the face service now returns with every /feed response. Stdlib only,
-so it runs with the container's plain python3:
+timings the face service returns with every /feed response:
 
-    python3 bench_face_profile.py                    # 20 feeds of 0.3s
-    python3 bench_face_profile.py --chunk-s 1.0 --feeds 8
+    uv run scripts/bench_face_profile.py
+    uv run scripts/bench_face_profile.py --chunk-s 1.0 --feeds 8
 """
 
 import argparse
 import json
 import time
 import urllib.request
+
+import structlog
+
+logger = structlog.get_logger("avatar.bench.face")
 
 BASE_URL = "http://localhost:8002"
 PCM_SAMPLE_RATE = 44100
@@ -52,26 +61,36 @@ def main() -> None:
         frames += len(result.get("frames", []))
         for stage, ms in result.get("profile", {}).items():
             stage_totals[stage] = stage_totals.get(stage, 0.0) + ms
-        print(
-            f"feed {index:2d}: {result.get('processing_ms', 0):7.1f}ms "
-            f"frames={len(result.get('frames', []))} "
-            + " ".join(f"{k}={v:.0f}" for k, v in sorted(result.get("profile", {}).items()))
+        logger.info(
+            "feed",
+            index=index,
+            processing_ms=result.get("processing_ms", 0),
+            frames=len(result.get("frames", [])),
+            **{k: round(v) for k, v in result.get("profile", {}).items()},
         )
     wall_s = time.perf_counter() - wall_started
     _post(f"/session/{session_id}/end", b"", "application/octet-stream")
 
-    audio_s = args.feeds * args.chunk_s
-    print("=" * 72)
-    print(f"chunk={args.chunk_s}s feeds={args.feeds} audio={audio_s:.1f}s")
-    print(f"frames={frames} wall={wall_s:.2f}s -> {frames / wall_s:.1f} fps (need {REALTIME_FPS})")
     staged = sum(stage_totals.values())
+    logger.info(
+        "summary",
+        chunk_s=args.chunk_s,
+        feeds=args.feeds,
+        audio_s=round(args.feeds * args.chunk_s, 1),
+        frames=frames,
+        wall_s=round(wall_s, 2),
+        fps=round(frames / wall_s, 1),
+        fps_needed=REALTIME_FPS,
+        attributed_pct=round(100 * staged / (wall_s * 1000), 1),
+    )
     for stage, total in sorted(stage_totals.items(), key=lambda item: -item[1]):
-        print(
-            f"  {stage:12s} {total:8.1f}ms total  {total / max(frames, 1):6.2f}ms/frame  "
-            f"{100 * total / staged:5.1f}% of staged"
+        logger.info(
+            "stage",
+            name=stage,
+            total_ms=round(total, 1),
+            ms_per_frame=round(total / max(frames, 1), 2),
+            share_pct=round(100 * total / staged, 1),
         )
-    print(f"  staged sum   {staged:8.1f}ms of {wall_s * 1000:.1f}ms wall "
-          f"({100 * staged / (wall_s * 1000):.1f}% attributed)")
 
 
 if __name__ == "__main__":
