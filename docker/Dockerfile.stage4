@@ -8,7 +8,7 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=1
 RUN apt-get update -qq \
     && apt-get install -y -qq supervisor git curl software-properties-common \
     && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get install -y -qq python3.11 python3.11-venv \
+    && apt-get install -y -qq python3.11 python3.11-venv python3.11-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3.11 -m venv /opt/llm-venv \
