@@ -19,7 +19,7 @@ from starlette.requests import Request
 
 from src.llm.chunker import SentenceChunker
 from src.llm.client import ChatSession, LLMClient
-from src.tts.client import TTSClient
+from src.tts.engine import create_engine, wrap_wav
 
 logger = logging.getLogger("avatar.server")
 logging.basicConfig(
@@ -31,7 +31,7 @@ app = FastAPI(title="Avatar Server", version="0.5.0")
 
 # Service clients — initialized once, reused across requests
 llm_client = LLMClient()
-tts_client = TTSClient()
+tts_client = create_engine()
 logger.info("Voice cloning disabled by default (upload refs via /voice/reference, enable via /voice/enable)")
 
 # Face animation (optional, gated by FACE_ENABLED env var)
@@ -419,20 +419,21 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
                 break
             try:
                 chunk_idx = 0
-                async for wav_chunk in tts_client.synthesize_streaming(sentence):
+                async for pcm_chunk in tts_client.synthesize_streaming(sentence):
                     # Send audio immediately (decoupled — never blocked by face)
                     await ws.send_bytes(msgpack.packb({
                         "type": "chat_audio",
-                        "data": base64.b64encode(wav_chunk).decode("ascii"),
+                        "data": base64.b64encode(
+                            wrap_wav(pcm_chunk, tts_client.sample_rate)
+                        ).decode("ascii"),
                         "sentence": sentence if chunk_idx == 0 else "",
                         "chat_id": chat_id,
                         "server_ts": time.time(),
                     }))
 
-                    # Fork raw PCM to video pipeline (strip 44-byte WAV header)
-                    if video_pcm_queue is not None and len(wav_chunk) > 44:
-                        raw_pcm = wav_chunk[44:]
-                        await video_pcm_queue.put(raw_pcm)
+                    # Fork raw PCM to video pipeline
+                    if video_pcm_queue is not None and pcm_chunk:
+                        await video_pcm_queue.put(pcm_chunk)
 
                     chunk_idx += 1
                 audio_chunk_count += chunk_idx
@@ -454,9 +455,7 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
         if video_pcm_queue is None or face_session_id is None or face_client is None:
             return
 
-        # Batch parameters: accumulate ~300ms of audio before feeding
-        # 44100Hz * 2 bytes/sample * 0.3s = 26460 bytes
-        batch_threshold = 26460
+        batch_threshold = int(tts_client.sample_rate * 2 * 0.3)
         pcm_batch = bytearray()
         frame_idx = 0
 
