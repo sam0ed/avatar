@@ -28,11 +28,17 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from starlette.requests import Request
 
-from musetalk_audio import HOLDBACK_FRAMES, append_pcm, total_frames, window_chunks
+from musetalk_audio import (
+    HOLDBACK_FRAMES,
+    PCM_SAMPLE_RATE,
+    append_pcm,
+    total_frames,
+    window_chunks,
+)
 from musetalk_avatar import AvatarData, build_avatar, load_cached_avatars
 from musetalk_models import MuseTalkModels, load_models
 from musetalk_profiling import StageTimer
-from musetalk_render import encode_jpeg, render_frames
+from musetalk_render import CPU_POOL, encode_jpeg, render_frames
 
 logger = logging.getLogger("avatar.face_server")
 logging.basicConfig(
@@ -50,6 +56,7 @@ _models: MuseTalkModels | None = None
 _avatars: dict[str, AvatarData] = {}
 _sessions: dict[str, "AnimationSession"] = {}
 _gpu = asyncio.Lock()
+_render_warmed = False
 
 
 @dataclass
@@ -85,6 +92,30 @@ async def _sweep_idle_sessions() -> None:
             logger.warning("Swept abandoned session %s", session_id)
 
 
+def _warm_render_path(models: MuseTalkModels, avatar: AvatarData) -> None:
+    """Render one second of silence through the real feed path, once.
+
+    The first feed of a cold process pays for lazy imports (librosa, MuseTalk's
+    datagen and blending helpers) and cuDNN autotuning of the UNet/VAE shapes —
+    measured at ~17s on an A6000, all of which landed on the first conversation
+    turn. Paying it at startup instead makes the first real feed a steady-state
+    feed.
+    """
+    global _render_warmed
+    session = AnimationSession(session_id="warmup", avatar=avatar)
+    silence = b"\x00" * (PCM_SAMPLE_RATE * 2)
+    session.audio_16k, session.pcm_remainder = append_pcm(
+        session.audio_16k, session.pcm_remainder, silence
+    )
+    started = time.monotonic()
+    rendered, profile = _render_pending(session, models, HOLDBACK_FRAMES)
+    _render_warmed = True
+    logger.info(
+        "Render path warmed: %d frames in %.1fs %s",
+        len(rendered), time.monotonic() - started, profile,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load MuseTalk once, and run the session sweeper for the process lifetime."""
@@ -92,6 +123,9 @@ async def lifespan(app: FastAPI):
     AVATARS_DIR.mkdir(parents=True, exist_ok=True)
     _models = await run_in_threadpool(load_models)
     _avatars.update(await run_in_threadpool(load_cached_avatars, AVATARS_DIR))
+    if _avatars:
+        first_avatar = next(iter(_avatars.values()))
+        await run_in_threadpool(_warm_render_path, _models, first_avatar)
     sweeper = asyncio.create_task(_sweep_idle_sessions())
     logger.info("Face animation service ready on port 8002")
     try:
@@ -153,8 +187,8 @@ def _render_pending(
 
     encoded: list[tuple[int, str]] = []
     with timer.stage("jpeg"):
-        for frame_index, frame in rendered:
-            jpeg = encode_jpeg(frame)
+        jpegs = CPU_POOL.map(lambda item: encode_jpeg(item[1]), rendered)
+        for (frame_index, _), jpeg in zip(rendered, jpegs):
             if jpeg is not None:
                 encoded.append((frame_index, base64.b64encode(jpeg).decode("ascii")))
 
@@ -223,6 +257,8 @@ async def prepare_avatar(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     _avatars[avatar_id] = avatar
+    if not _render_warmed:
+        await _run_on_gpu(_warm_render_path, models, avatar)
     return {
         "avatar_id": avatar_id,
         "frame_count": avatar.frame_count,

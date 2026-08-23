@@ -1,6 +1,8 @@
 """Whisper chunks plus avatar material to finished JPEG frames."""
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -14,6 +16,9 @@ logger = logging.getLogger("avatar.face.render")
 
 BATCH_SIZE = 8
 JPEG_QUALITY = 80
+CPU_WORKERS = min(8, os.cpu_count() or 1)
+
+CPU_POOL = ThreadPoolExecutor(max_workers=CPU_WORKERS, thread_name_prefix="face-cpu")
 
 
 def encode_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes | None:
@@ -96,11 +101,14 @@ def render_frames(
                 recon = models.vae.decode_latents(predicted.to(dtype=models.vae.vae.dtype))
 
         with timer.stage("blend"):
-            for generated_face in recon:
-                frame_index = start_index + produced
-                produced += 1
-                blended = _blend_into_frame(avatar, frame_index, generated_face)
+            batch_first_index = start_index + produced
+            produced += len(recon)
+            blended_batch = CPU_POOL.map(
+                lambda item: _blend_into_frame(avatar, batch_first_index + item[0], item[1]),
+                enumerate(recon),
+            )
+            for offset, blended in enumerate(blended_batch):
                 if blended is not None:
-                    frames.append((frame_index, blended))
+                    frames.append((batch_first_index + offset, blended))
 
     return frames
