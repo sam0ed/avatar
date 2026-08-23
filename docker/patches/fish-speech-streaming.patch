@@ -37,9 +37,18 @@ index f54de5b..e392c01 100644
                  if req.streaming:  # Used only by the API server
                      yield InferenceResult(
 diff --git a/fish_speech/models/text2semantic/inference.py b/fish_speech/models/text2semantic/inference.py
-index d940be4..3ae4e3b 100644
+index d940be4..68232bb 100644
 --- a/fish_speech/models/text2semantic/inference.py
 +++ b/fish_speech/models/text2semantic/inference.py
+@@ -201,7 +201,7 @@ def decode_n_tokens(
+             window = previous_tokens[:, i - win_size : i]
+ 
+         with sdpa_kernel(
+-            SDPBackend.MATH
++            SDPBackend.EFFICIENT_ATTENTION
+         ):  # Actually better for Inductor to codegen attention here
+             next_token = decode_one_token(
+                 model=model,
 @@ -388,6 +388,162 @@ class GenerateResponse:
      action: Literal["sample", "next"]
      codes: Optional[torch.Tensor] = None
@@ -172,7 +181,7 @@ index d940be4..3ae4e3b 100644
 +        else:
 +            window = previous_tokens[:, i - win_size : i]
 +
-+        with sdpa_kernel(SDPBackend.MATH):
++        with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
 +            next_token = decode_one_token(
 +                model=model,
 +                x=cur_token,
