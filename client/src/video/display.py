@@ -45,7 +45,7 @@ class VideoDisplay:
         self._audio_position = audio_position
         self._frame_buffer: deque[tuple[int, bytes]] = deque(maxlen=_FRAME_BUFFER_MAX)
         self._live_fps: int = _DEFAULT_LIVE_FPS
-        self._idle_frames: list[np.ndarray] = []
+        self._idle_frames: list[bytes] = []
         self._idle_fps: int = _DEFAULT_LIVE_FPS
         self._cursor: int = 0
         self._turn_offset: int = 0
@@ -92,16 +92,16 @@ class VideoDisplay:
             self._idle_mode = False
 
     def set_idle_frames(self, frames: list[bytes], fps: int = _DEFAULT_LIVE_FPS) -> None:
-        """Set the full reference frame cycle for idle animation (JPEG bytes)."""
-        decoded = []
-        for jpeg in frames:
-            frame = self._decode_jpeg(jpeg)
-            if frame is not None:
-                decoded.append(frame)
+        """Set the full reference frame cycle for idle animation.
+
+        Frames stay JPEG-encoded (~25MB total) and are decoded one at a time
+        at display; pre-decoding 958 frames costs >1GB RAM and made the
+        display loop stall on paging.
+        """
         with self._lock:
-            self._idle_frames = decoded
+            self._idle_frames = list(frames)
             self._idle_fps = fps or _DEFAULT_LIVE_FPS
-        logger.info("Set %d idle frames at %d fps", len(decoded), fps)
+        logger.info("Set %d idle frames at %d fps", len(frames), fps)
 
     def set_idle_mode(self, enabled: bool) -> None:
         """Switch between live and idle display modes; the cursor carries over."""
@@ -155,12 +155,22 @@ class VideoDisplay:
                 if self._idle_frames:
                     interval = 1.0 / self._idle_fps
                     advanced = int((now - last_idle_tick) / interval)
-                    if advanced > 0:
+                    if advanced > 3:
+                        # After a stall, resync the clock instead of skipping
+                        # ahead — a visible jump is worse than lost time.
+                        advanced = 1
+                        last_idle_tick = now
+                    elif advanced > 0:
                         last_idle_tick += advanced * interval
+                    if advanced > 0:
                         with self._lock:
                             self._cursor += advanced
                             idx = pingpong_index(self._cursor, len(self._idle_frames))
-                            self._current_frame = self._idle_frames[idx]
+                            jpeg = self._idle_frames[idx]
+                        frame = self._decode_jpeg(jpeg)
+                        if frame is not None:
+                            with self._lock:
+                                self._current_frame = frame
             else:
                 last_idle_tick = now
                 due = self._due_frame()
