@@ -107,7 +107,9 @@ class FaceVoiceClient:
         """
         try:
             logger.info("Connecting to %s ...", self.server_url)
-            self._ws = await websockets.connect(self.server_url)
+            # The full idle-frame cycle arrives as one ~25MB message; the
+            # library default max_size (1MB) would kill the connection.
+            self._ws = await websockets.connect(self.server_url, max_size=64 * 1024 * 1024)
             logger.info("Connected to server")
             return True
         except Exception as e:
@@ -139,7 +141,7 @@ class FaceVoiceClient:
             else:
                 logger.info("No idle frames available (face not enabled?)")
         except Exception:
-            logger.debug("Idle frames unavailable", exc_info=True)
+            logger.warning("Idle frames failed to load — idle animation degraded", exc_info=True)
 
     async def _initialize_asr(self) -> bool:
         """Download model and initialize the speech transcriber.
