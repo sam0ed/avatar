@@ -40,7 +40,8 @@ class AudioPlayer:
     flow, so there is never a concurrent abort/write race.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, output_device: int | str | None = None) -> None:
+        self._output_device = output_device
         self._stream: sd.RawOutputStream | None = None
         self._cancelled = False
         self._playing = False
@@ -131,6 +132,7 @@ class AudioPlayer:
                                 samplerate=wf.getframerate(),
                                 channels=wf.getnchannels(),
                                 dtype="int16",
+                                device=self._output_device,
                             )
                             self._stream.start()
                             self._output_latency = float(self._stream.latency or 0.0)

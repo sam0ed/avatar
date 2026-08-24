@@ -41,8 +41,13 @@ def pingpong_index(position: int, frame_count: int) -> int:
 class VideoDisplay:
     """Thread-based OpenCV window; live pacing follows audio_position()."""
 
-    def __init__(self, audio_position: Callable[[], float | None] | None = None) -> None:
+    def __init__(
+        self,
+        audio_position: Callable[[], float | None] | None = None,
+        on_key: Callable[[int], None] | None = None,
+    ) -> None:
         self._audio_position = audio_position
+        self._on_key = on_key
         self._frame_buffer: deque[tuple[int, bytes]] = deque(maxlen=_FRAME_BUFFER_MAX)
         self._live_fps: int = _DEFAULT_LIVE_FPS
         self._idle_frames: list[bytes] = []
@@ -133,6 +138,11 @@ class VideoDisplay:
         """Number of frames waiting in the buffer."""
         return len(self._frame_buffer)
 
+    def current_frame(self) -> np.ndarray | None:
+        """Latest frame shown in the window (idle or live), for external sinks."""
+        with self._lock:
+            return self._current_frame
+
     def _decode_jpeg(self, jpeg_bytes: bytes) -> np.ndarray | None:
         """Decode JPEG bytes to a BGR numpy array."""
         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
@@ -187,5 +197,7 @@ class VideoDisplay:
             if key == 27:
                 self._running = False
                 break
+            if key != 255 and self._on_key is not None:
+                self._on_key(key)
 
         cv2.destroyWindow(_WINDOW_NAME)

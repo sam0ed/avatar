@@ -84,20 +84,47 @@ class FaceVoiceClient:
         language: str = "en",
         device: int | str | None = None,
         use_smart_turn: bool = True,
+        meeting: bool = False,
     ) -> None:
-        """Initialize face voice client."""
+        """Initialize face voice client; meeting=True routes A/V to virtual devices."""
         self.server_url = server_url
         self.play_audio = play_audio
         self._ws: ClientConnection | None = None
         self._transcriber = SpeechTranscriber(language=language, device=device)
-        self._player = AudioPlayer()
+        self._router = None
+        output_device = None
+        if meeting:
+            from output.devices import find_cable_output_device
+            from output.router import OutputMode, OutputRouter
+
+            output_device = find_cable_output_device()
+            self._router = OutputRouter(
+                avatar_frame=lambda: self._video_display.current_frame(),
+                cable_device=output_device,
+                on_mode_change=self._on_output_mode_change,
+            )
+            self._output_mode_cls = OutputMode
+        self._player = AudioPlayer(output_device=output_device)
         self._video_display = VideoDisplay(
-            audio_position=lambda: self._player.played_seconds
+            audio_position=lambda: self._player.played_seconds,
+            on_key=self._on_display_key,
         )
         self._running = False
         self._use_smart_turn = use_smart_turn
         self._smart_turn = None  # SmartTurnAnalyzer, initialized in run()
         self._chat_seq = 0  # Incrementing chat ID for message correlation
+
+    def _on_display_key(self, key: int) -> None:
+        if self._router is not None and key in (ord("a"), ord("A")):
+            mode = self._router.toggle()
+            print(f"\n\033[96m[output: {mode.value}]\033[0m", flush=True)
+
+    def _on_output_mode_change(self, mode) -> None:
+        if mode == self._output_mode_cls.ME:
+            self._player.cancel()
+            self._transcriber.mute()
+        else:
+            self._transcriber.unmute()
 
     async def connect(self) -> bool:
         """Establish WebSocket connection.
@@ -524,6 +551,11 @@ class FaceVoiceClient:
         self._video_display.start()
         await self._load_idle_frames()
 
+        if self._router is not None:
+            self._router.start()
+            print("\033[96m[Meeting mode: virtual camera + VB-Cable active; "
+                  "press 'a' in the video window to toggle avatar/me]\033[0m")
+
         # Start mic capture
         self._transcriber.start()
 
@@ -576,6 +608,8 @@ class FaceVoiceClient:
         finally:
             self._running = False
             quit_task.cancel()
+            if self._router is not None:
+                self._router.stop()
             self._transcriber.close()
             self._video_display.stop()
             if self._ws:
@@ -629,6 +663,11 @@ def main() -> None:
         action="store_true",
         help="Disable Smart Turn end-of-turn detection",
     )
+    parser.add_argument(
+        "--meeting",
+        action="store_true",
+        help="Route avatar A/V to the virtual camera and VB-Cable; 'a' toggles avatar/me",
+    )
     args = parser.parse_args()
 
     client = FaceVoiceClient(
@@ -637,6 +676,7 @@ def main() -> None:
         language=args.language,
         device=args.device,
         use_smart_turn=not args.no_smart_turn,
+        meeting=args.meeting,
     )
 
     try:
