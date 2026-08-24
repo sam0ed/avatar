@@ -50,17 +50,17 @@ class SpeechTranscriber:
         language: str = "en",
         update_interval: float = 0.5,
         device: int | str | None = None,
+        external_source: bool = False,
     ) -> None:
         """Initialize the speech transcriber.
 
-        Args:
-            language: Language code (e.g., "en").
-            update_interval: How often Moonshine updates transcription (seconds).
-            device: sounddevice input device index or name (None = default).
+        external_source=True skips the microphone stream; audio arrives via
+        push_audio() instead (e.g. system-loopback capture of a meeting).
         """
         self._language = language
         self._update_interval = update_interval
         self._device = device
+        self._external_source = external_source
         self._loop: asyncio.AbstractEventLoop | None = None
         self._transcriber: Transcriber | None = None
         self._sd_stream: sd.InputStream | None = None
@@ -132,6 +132,10 @@ class SpeechTranscriber:
         )
         self._worker_thread.start()
 
+        if self._external_source:
+            logger.info("Transcriber ready for pushed audio (rate=%d)", SAMPLE_RATE)
+            return
+
         self._sd_stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
@@ -146,6 +150,12 @@ class SpeechTranscriber:
             "Microphone capture started (rate=%d, block=%d, device=%s)",
             SAMPLE_RATE, BLOCK_SIZE, self._device or "default",
         )
+
+    def push_audio(self, block) -> None:
+        """Feed a mono float32 block at SAMPLE_RATE from an external source."""
+        if not self._listening or self._transcriber is None:
+            return
+        self._audio_queue.put_nowait(block)
 
     def stop(self) -> None:
         """Stop capturing audio and end the transcription session."""

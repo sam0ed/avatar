@@ -85,12 +85,20 @@ class FaceVoiceClient:
         device: int | str | None = None,
         use_smart_turn: bool = True,
         meeting: bool = False,
+        ears: str = "mic",
     ) -> None:
         """Initialize face voice client; meeting=True routes A/V to virtual devices."""
         self.server_url = server_url
         self.play_audio = play_audio
         self._ws: ClientConnection | None = None
-        self._transcriber = SpeechTranscriber(language=language, device=device)
+        self._transcriber = SpeechTranscriber(
+            language=language, device=device, external_source=(ears == "meeting")
+        )
+        self._ears = None
+        if ears == "meeting":
+            from output.meeting_ears import MeetingEars
+
+            self._ears = MeetingEars(self._transcriber.push_audio)
         self._router = None
         output_device = None
         if meeting:
@@ -556,8 +564,11 @@ class FaceVoiceClient:
             print("\033[96m[Meeting mode: virtual camera + VB-Cable active; "
                   "press 'a' in the video window to toggle avatar/me]\033[0m")
 
-        # Start mic capture
+        # Start audio capture (microphone, or system loopback in meeting mode)
         self._transcriber.start()
+        if self._ears is not None:
+            self._ears.start()
+            print("\033[96m[Ears: system loopback — the avatar hears the meeting]\033[0m")
 
         # Background task for keyboard input (quit command)
         quit_event = asyncio.Event()
@@ -608,6 +619,8 @@ class FaceVoiceClient:
         finally:
             self._running = False
             quit_task.cancel()
+            if self._ears is not None:
+                self._ears.stop()
             if self._router is not None:
                 self._router.stop()
             self._transcriber.close()
@@ -668,8 +681,16 @@ def main() -> None:
         action="store_true",
         help="Route avatar A/V to the virtual camera and VB-Cable; 'a' toggles avatar/me",
     )
+    parser.add_argument(
+        "--ears",
+        choices=("mic", "meeting"),
+        default=None,
+        help="What the avatar listens to: your mic, or the meeting via system "
+        "loopback (default: meeting when --meeting is set, mic otherwise)",
+    )
     args = parser.parse_args()
 
+    ears = args.ears or ("meeting" if args.meeting else "mic")
     client = FaceVoiceClient(
         server_url=args.server_url,
         play_audio=not args.no_audio,
@@ -677,6 +698,7 @@ def main() -> None:
         device=args.device,
         use_smart_turn=not args.no_smart_turn,
         meeting=args.meeting,
+        ears=ears,
     )
 
     try:
