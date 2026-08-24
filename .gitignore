@@ -52,10 +52,9 @@ docker/.env
 # Voice recordings (personal voice samples)
 recordings/
 
-# TTS/test output
-output/
+# TTS/test output (repo root only; client/src/output is a package)
+/output/
 recordings/
-output/
 logs.md
 
 # Local research notes — deliberately untracked
