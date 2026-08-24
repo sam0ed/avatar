@@ -19,7 +19,10 @@ _IDLE_FPS = 5
 _IDLE_INTERVAL = 1.0 / _IDLE_FPS
 
 _DEFAULT_LIVE_FPS = 25
-_FRAME_BUFFER_MAX = 300
+# Higgs generates audio 2.5-4x faster than real time, so frames arrive ~42fps
+# against 25fps consumption; the buffer must absorb the whole surplus of a long
+# turn or the deque evicts exactly the frames due next (video freezes mid-turn).
+_FRAME_BUFFER_MAX = 3000
 
 _WINDOW_NAME = "Avatar"
 
