@@ -16,7 +16,7 @@ logger = logging.getLogger("avatar.face.render")
 
 BATCH_SIZE = 8
 JPEG_QUALITY = 80
-WIRE_MAX_WIDTH = int(os.environ.get("FACE_WIRE_MAX_WIDTH", "640"))
+WIRE_MAX_WIDTH = int(os.environ.get("FACE_WIRE_MAX_WIDTH", "0"))
 CPU_WORKERS = min(8, os.cpu_count() or 1)
 
 CPU_POOL = ThreadPoolExecutor(max_workers=CPU_WORKERS, thread_name_prefix="face-cpu")
