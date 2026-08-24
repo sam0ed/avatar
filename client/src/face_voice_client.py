@@ -212,7 +212,7 @@ class FaceVoiceClient:
                 return text
 
             self._player.pause()
-            logger.debug("Barge-in: speech detected, playback paused")
+            print("\033[93m[barge-in: speech detected, paused]\033[0m", flush=True)
 
             try:
                 text = await asyncio.wait_for(
@@ -221,16 +221,17 @@ class FaceVoiceClient:
                 )
             except asyncio.TimeoutError:
                 self._player.cancel()
-                logger.info("Barge-in: sustained speech past timeout, cancelling")
+                print("\033[93m[barge-in: sustained speech, cancelled]\033[0m", flush=True)
                 text = await self._transcriber.get_next_line()
                 return text
 
             if self._is_backchannel_only(text):
                 self._player.resume()
-                logger.debug("Barge-in: backchannel, resuming playback")
+                print(f"\033[93m[barge-in: backchannel '{text}', resumed]\033[0m", flush=True)
                 continue
 
             self._player.cancel()
+            print(f"\033[93m[barge-in: interrupted by '{text}']\033[0m", flush=True)
             return text
 
     async def _process_chat(self, text: str) -> str | None:
