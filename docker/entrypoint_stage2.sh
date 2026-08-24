@@ -208,6 +208,7 @@ PY
 
     cp /app/orchestrator/src/face/face_server.py "$MUSETALK_DIR/"
     cp /app/orchestrator/src/face/musetalk_*.py "$MUSETALK_DIR/"
+    cp /app/orchestrator/src/face/frame_cycle.py "$MUSETALK_DIR/"
     echo "[3d] MuseTalk setup complete"
 else
     echo "[3] FACE_ENABLED=false, skipping MuseTalk setup"
