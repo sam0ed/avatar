@@ -16,17 +16,22 @@ logger = logging.getLogger("avatar.face.render")
 
 BATCH_SIZE = 8
 JPEG_QUALITY = 80
+WIRE_MAX_WIDTH = int(os.environ.get("FACE_WIRE_MAX_WIDTH", "640"))
 CPU_WORKERS = min(8, os.cpu_count() or 1)
 
 CPU_POOL = ThreadPoolExecutor(max_workers=CPU_WORKERS, thread_name_prefix="face-cpu")
 
 
 def encode_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes | None:
-    """Compress a BGR frame to JPEG bytes.
+    """Compress a BGR frame to JPEG bytes, downscaled to the wire width.
 
-    Avatar material is already prepared at stream resolution, so there is no
-    resize here: the frame handed in is the frame that goes on the wire.
+    The 25fps JPEG stream must fit residential downlinks (measured hosts
+    deliver 2-6 Mbit/s to the client), so frames wider than WIRE_MAX_WIDTH
+    are scaled down before encoding; 0 disables the cap.
     """
+    if WIRE_MAX_WIDTH and frame.shape[1] > WIRE_MAX_WIDTH:
+        height = round(frame.shape[0] * WIRE_MAX_WIDTH / frame.shape[1])
+        frame = cv2.resize(frame, (WIRE_MAX_WIDTH, height), interpolation=cv2.INTER_AREA)
     ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buffer.tobytes() if ok else None
 
