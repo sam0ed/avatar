@@ -73,6 +73,8 @@ class SpeechTranscriber:
         # Speech duration tracking (for barge-in pre-filters)
         self._speech_start_time: float = 0.0
         self._last_speech_duration: float = 0.0
+        # Monotonic stamp of the newest completed line (for latency accounting)
+        self.last_line_completed_at: float = 0.0
         # Raw audio ring buffer (for Smart Turn analysis)
         self._audio_buffer: list[np.ndarray] = []
         self._max_buffer_chunks = int(10 * SAMPLE_RATE / BLOCK_SIZE)  # 10 seconds
@@ -298,8 +300,9 @@ class SpeechTranscriber:
 
     def _on_line_completed(self, text: str) -> None:
         """Called from Moonshine thread when a speech segment is completed."""
+        self.last_line_completed_at = time.monotonic()
         if self._speech_start_time > 0:
-            self._last_speech_duration = time.monotonic() - self._speech_start_time
+            self._last_speech_duration = self.last_line_completed_at - self._speech_start_time
         text = text.strip()
         if not text:
             return

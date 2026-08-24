@@ -48,10 +48,16 @@ class AudioPlayer:
         self._written_seconds = 0.0
         self._output_latency = 0.0
         self._t_last_write: float | None = None
+        self.first_write_at: float | None = None
         # Used to wake a blocked queue.get() when cancel() is called.
         self._cancel_event: asyncio.Event = asyncio.Event()
         # Used to wake a blocked pause wait when resume()/cancel() is called.
         self._resume_event: asyncio.Event = asyncio.Event()
+
+    @property
+    def output_latency(self) -> float:
+        """Device output latency of the active stream, in seconds."""
+        return self._output_latency
 
     @property
     def is_playing(self) -> bool:
@@ -91,6 +97,7 @@ class AudioPlayer:
         self._written_seconds = 0.0
         self._output_latency = 0.0
         self._t_last_write = None
+        self.first_write_at = None
         self._cancel_event.clear()
         self._resume_event.clear()
         self._playing = True
@@ -179,6 +186,8 @@ class AudioPlayer:
                         await loop.run_in_executor(
                             None, self._stream.write, pcm[offset:end]
                         )
+                        if self.first_write_at is None:
+                            self.first_write_at = time.monotonic()
                         self._written_seconds += (end - offset) / bytes_per_second
                         self._t_last_write = time.monotonic()
                         offset = end

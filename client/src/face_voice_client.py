@@ -263,6 +263,7 @@ class FaceVoiceClient:
 
         # Timing metrics
         start_time = time.perf_counter()
+        t_send_mono = time.monotonic()
         first_token_time: float | None = None
         first_audio_time: float | None = None
         token_count = 0
@@ -396,6 +397,22 @@ class FaceVoiceClient:
                 stats.append("INTERRUPTED")
             print(f"\033[90m[{' | '.join(stats)}]\033[0m")
 
+            # ── Perceived-latency breakdown (speech end → audible sound) ──
+            t_line = getattr(self, "_t_line_completed", 0.0)
+            first_write = self._player.first_write_at
+            if t_line > 0 and first_audio_time is not None and first_write is not None:
+                turn_wait = t_send_mono - t_line
+                send_to_msg = first_audio_time - start_time
+                msg_to_sound = (
+                    first_write - (t_send_mono + send_to_msg) + self._player.output_latency
+                )
+                perceived = first_write + self._player.output_latency - t_line
+                print(
+                    f"\033[90m[Perceived: {perceived:.2f}s = "
+                    f"turn-detect {turn_wait:.2f}s + server {send_to_msg:.2f}s + "
+                    f"playout {msg_to_sound:.2f}s  (+ VAD tail before that)]\033[0m"
+                )
+
             # ── Clean up audio player ──
             if player_task is not None:
                 if player_task.done():
@@ -526,6 +543,7 @@ class FaceVoiceClient:
                     text = line_task.result()
 
                 # Smart Turn: accumulate until turn is complete
+                self._t_line_completed = self._transcriber.last_line_completed_at
                 if self._smart_turn is not None:
                     print(f"\033[1mYou:\033[0m {text}", end="", flush=True)
                     text = await self._wait_for_complete_turn(text)
