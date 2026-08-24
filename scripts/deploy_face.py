@@ -37,7 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMAGE = "ghcr.io/sam0ed/avatar-stage4:latest"
 GITHUB_REPO = "https://github.com/sam0ed/avatar.git"
 DISK = "120"  # Extra for MuseTalk models + venv
-BLOCKED_REGIONS = {"CN", "RU"}
+BLOCKED_REGIONS = {"RU"}
 
 
 def get_hf_token() -> str:

@@ -28,7 +28,7 @@ import sys
 
 IMAGE = "fishaudio/fish-speech:server-cuda"
 DISK = "50"
-BLOCKED_REGIONS = {"CN", "RU"}
+BLOCKED_REGIONS = {"RU"}
 
 
 def get_hf_token() -> str:

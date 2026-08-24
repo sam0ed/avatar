@@ -31,7 +31,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMAGE = "fishaudio/fish-speech:server-cuda"
 GITHUB_REPO = "https://github.com/sam0ed/avatar.git"
 DISK = "80"
-BLOCKED_REGIONS = {"CN", "RU"}
+BLOCKED_REGIONS = {"RU"}
 
 
 def get_hf_token() -> str:
