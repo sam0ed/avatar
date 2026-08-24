@@ -123,13 +123,19 @@ class FaceVoiceClient:
                 "type": "face_idle_frames",
                 "ts": time.time(),
             }))
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=20.0)
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=120.0)
             response = msgpack.unpackb(raw, raw=False)
             if response.get("type") != "face_idle_frames":
                 return
             frames = response.get("frames") or []
             if frames:
-                self._video_display.set_idle_frames(frames)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._video_display.set_idle_frames,
+                    frames,
+                    int(response.get("fps", 25)),
+                )
             else:
                 logger.info("No idle frames available (face not enabled?)")
         except Exception:
@@ -254,10 +260,12 @@ class FaceVoiceClient:
         self._chat_seq += 1
         chat_id = str(self._chat_seq)
 
+        avatar_cursor = self._video_display.cursor
         msg = {
             "type": "chat",
             "data": text,
             "chat_id": chat_id,
+            "avatar_cursor": avatar_cursor,
             "ts": time.time(),
         }
         await self._ws.send(msgpack.packb(msg))
@@ -283,8 +291,8 @@ class FaceVoiceClient:
         barge_in_text: str | None = None
         interrupted = False
 
-        # Switch video to live mode
-        self._video_display.set_idle_mode(False)
+        # Switch video to live mode anchored at the cursor we just sent
+        self._video_display.begin_live(avatar_cursor)
 
         print("\n\033[1mAvatar:\033[0m ", end="", flush=True)
 

@@ -1,7 +1,9 @@
 """OpenCV window for face frames, paced by the audio playback position.
 
-Frame i of a turn belongs to audio second i/fps: the display shows the frame
-matching what is currently audible, drops late frames, holds when ahead.
+Idle and speech share one continuous ping-pong cursor over the avatar's frame
+cycle: idle plays local reference frames along the cursor, speech shows server
+frames rendered for the same cycle positions (mouth replaced), and each shown
+speech frame re-anchors the cursor — so mode switches never jump pose.
 """
 
 import logging
@@ -15,9 +17,6 @@ import numpy as np
 
 logger = logging.getLogger("avatar.video")
 
-_IDLE_FPS = 5
-_IDLE_INTERVAL = 1.0 / _IDLE_FPS
-
 _DEFAULT_LIVE_FPS = 25
 # Higgs generates audio 2.5-4x faster than real time, so frames arrive ~42fps
 # against 25fps consumption; the buffer must absorb the whole surplus of a long
@@ -25,6 +24,18 @@ _DEFAULT_LIVE_FPS = 25
 _FRAME_BUFFER_MAX = 3000
 
 _WINDOW_NAME = "Avatar"
+
+
+def pingpong_index(position: int, frame_count: int) -> int:
+    """Map a monotonically growing position onto a forward-backward frame sweep.
+
+    Must match the server's mapping in musetalk_render.pingpong_index exactly.
+    """
+    if frame_count <= 1:
+        return 0
+    period = 2 * frame_count - 2
+    pos = position % period
+    return pos if pos < frame_count else period - pos
 
 
 class VideoDisplay:
@@ -35,7 +46,9 @@ class VideoDisplay:
         self._frame_buffer: deque[tuple[int, bytes]] = deque(maxlen=_FRAME_BUFFER_MAX)
         self._live_fps: int = _DEFAULT_LIVE_FPS
         self._idle_frames: list[np.ndarray] = []
-        self._idle_idx: int = 0
+        self._idle_fps: int = _DEFAULT_LIVE_FPS
+        self._cursor: int = 0
+        self._turn_offset: int = 0
         self._current_frame: np.ndarray | None = None
         self._running = False
         self._idle_mode = True
@@ -59,6 +72,18 @@ class VideoDisplay:
             self._thread = None
         logger.info("VideoDisplay stopped")
 
+    @property
+    def cursor(self) -> int:
+        """Current position in the shared frame cycle (send with each chat)."""
+        with self._lock:
+            return self._cursor
+
+    def begin_live(self, turn_offset: int) -> None:
+        """Enter live mode; server frame i maps to cycle position turn_offset + i."""
+        with self._lock:
+            self._turn_offset = turn_offset
+            self._idle_mode = False
+
     def show_frame(self, jpeg_bytes: bytes, frame_idx: int, fps: int = _DEFAULT_LIVE_FPS) -> None:
         """Enqueue a JPEG frame under its per-turn index."""
         with self._lock:
@@ -66,8 +91,8 @@ class VideoDisplay:
             self._live_fps = fps or _DEFAULT_LIVE_FPS
             self._idle_mode = False
 
-    def set_idle_frames(self, frames: list[bytes]) -> None:
-        """Set reference frames for idle animation (JPEG bytes)."""
+    def set_idle_frames(self, frames: list[bytes], fps: int = _DEFAULT_LIVE_FPS) -> None:
+        """Set the full reference frame cycle for idle animation (JPEG bytes)."""
         decoded = []
         for jpeg in frames:
             frame = self._decode_jpeg(jpeg)
@@ -75,11 +100,11 @@ class VideoDisplay:
                 decoded.append(frame)
         with self._lock:
             self._idle_frames = decoded
-            self._idle_idx = 0
-        logger.info("Set %d idle frames", len(decoded))
+            self._idle_fps = fps or _DEFAULT_LIVE_FPS
+        logger.info("Set %d idle frames at %d fps", len(decoded), fps)
 
     def set_idle_mode(self, enabled: bool) -> None:
-        """Switch between live and idle display modes."""
+        """Switch between live and idle display modes; the cursor carries over."""
         with self._lock:
             self._idle_mode = enabled
             if enabled:
@@ -94,8 +119,11 @@ class VideoDisplay:
         due_jpeg: bytes | None = None
         with self._lock:
             target_idx = int(position * self._live_fps)
+            due_idx: int | None = None
             while self._frame_buffer and self._frame_buffer[0][0] <= target_idx:
-                _, due_jpeg = self._frame_buffer.popleft()
+                due_idx, due_jpeg = self._frame_buffer.popleft()
+            if due_idx is not None:
+                self._cursor = self._turn_offset + due_idx
         if due_jpeg is None:
             return None
         return self._decode_jpeg(due_jpeg)
@@ -116,7 +144,7 @@ class VideoDisplay:
     def _display_loop(self) -> None:
         """Main display thread loop — renders frames via cv2.imshow."""
         cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_NORMAL)
-        last_idle_time = 0.0
+        last_idle_tick = time.monotonic()
 
         while self._running:
             now = time.monotonic()
@@ -124,12 +152,17 @@ class VideoDisplay:
                 idle = self._idle_mode
 
             if idle:
-                if self._idle_frames and now - last_idle_time >= _IDLE_INTERVAL:
-                    with self._lock:
-                        self._current_frame = self._idle_frames[self._idle_idx]
-                        self._idle_idx = (self._idle_idx + 1) % len(self._idle_frames)
-                    last_idle_time = now
+                if self._idle_frames:
+                    interval = 1.0 / self._idle_fps
+                    advanced = int((now - last_idle_tick) / interval)
+                    if advanced > 0:
+                        last_idle_tick += advanced * interval
+                        with self._lock:
+                            self._cursor += advanced
+                            idx = pingpong_index(self._cursor, len(self._idle_frames))
+                            self._current_frame = self._idle_frames[idx]
             else:
+                last_idle_tick = now
                 due = self._due_frame()
                 if due is not None:
                     with self._lock:
@@ -137,7 +170,6 @@ class VideoDisplay:
 
             with self._lock:
                 frame = self._current_frame
-
             if frame is not None:
                 cv2.imshow(_WINDOW_NAME, frame)
 

@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import torch
 
+from frame_cycle import pingpong_index
 from musetalk_avatar import AvatarData
 from musetalk_models import MuseTalkModels
 from musetalk_profiling import StageTimer
@@ -44,7 +45,7 @@ def _blend_into_frame(
     """Paste a generated mouth region back into its original frame."""
     from musetalk.utils.blending import get_image_blending
 
-    idx = frame_index % avatar.frame_count
+    idx = pingpong_index(frame_index, avatar.frame_count)
     x1, y1, x2, y2 = avatar.coords[idx]
     try:
         resized = cv2.resize(generated_face.astype(np.uint8), (x2 - x1, y2 - y1))
@@ -64,7 +65,7 @@ def _blend_into_frame(
 def _latents_for(avatar: AvatarData, start_index: int, count: int) -> list:
     """Select the avatar latent that pairs with each requested frame."""
     return [
-        avatar.latents[(start_index + offset) % avatar.frame_count]
+        avatar.latents[pingpong_index(start_index + offset, avatar.frame_count)]
         for offset in range(count)
     ]
 

@@ -302,13 +302,14 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
             elif msg_type == "face_idle_frames":
                 frames: list[bytes] = []
+                idle_fps = 25
                 if FACE_ENABLED and face_client is not None and _active_avatar_id is not None:
                     with contextlib.suppress(Exception):
-                        frames = await face_client.get_idle_frames(_active_avatar_id)
+                        frames, idle_fps = await face_client.get_idle_frames(_active_avatar_id)
                 await ws.send_bytes(msgpack.packb({
                     "type": "face_idle_frames",
                     "frames": frames,
-                    "fps": 5,
+                    "fps": idle_fps,
                     "server_ts": time.time(),
                 }))
 
@@ -398,11 +399,14 @@ async def _handle_chat(ws: WebSocket, client_id: str, msg: dict) -> None:
     video_pcm_queue: asyncio.Queue[bytes | None] | None = None
     face_session_id: str | None = None
 
+    avatar_cursor = max(0, int(msg.get("avatar_cursor", 0)))
     if FACE_ENABLED and face_client is not None and _active_avatar_id is not None:
         video_pcm_queue = asyncio.Queue()
         try:
             face_session_id = await face_client.start_session(
-                _active_avatar_id, sample_rate=tts_client.sample_rate
+                _active_avatar_id,
+                sample_rate=tts_client.sample_rate,
+                start_offset=avatar_cursor,
             )
         except Exception:
             logger.warning("Failed to start face session, continuing audio-only")

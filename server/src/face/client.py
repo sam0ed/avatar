@@ -88,15 +88,29 @@ class FaceAnimationClient:
         )
         return result
 
-    async def start_session(self, avatar_id: str = "default", sample_rate: int = 44100) -> str:
-        """Start a streaming animation session fed with PCM at the given sample rate."""
+    async def start_session(
+        self,
+        avatar_id: str = "default",
+        sample_rate: int = 44100,
+        start_offset: int = 0,
+    ) -> str:
+        """Start a streaming animation session fed with PCM at the given sample rate.
+
+        start_offset anchors rendering to the client's current idle-cycle position.
+        """
         resp = await self._http.post(
             f"{self.base_url}/session/start",
-            data={"avatar_id": avatar_id, "sample_rate": str(sample_rate)},
+            data={
+                "avatar_id": avatar_id,
+                "sample_rate": str(sample_rate),
+                "start_offset": str(start_offset),
+            },
         )
         resp.raise_for_status()
         session_id = resp.json()["session_id"]
-        logger.info("Face session started: %s (avatar=%s)", session_id, avatar_id)
+        logger.info(
+            "Face session started: %s (avatar=%s, offset=%d)", session_id, avatar_id, start_offset
+        )
         return session_id
 
     async def feed_audio(self, session_id: str, pcm_chunk: bytes) -> list[bytes]:
@@ -154,19 +168,18 @@ class FaceAnimationClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def get_idle_frames(self, avatar_id: str, max_frames: int = 30) -> list[bytes]:
-        """Get reference frames for client-side idle animation.
+    async def get_idle_frames(self, avatar_id: str, max_frames: int = 0) -> tuple[list[bytes], int]:
+        """Get reference frames for the client-side idle loop.
 
-        Args:
-            avatar_id: Avatar to get frames from.
-            max_frames: Maximum number of frames to return.
+        max_frames=0 returns the full ordered cycle at the live frame rate.
 
         Returns:
-            List of JPEG frame bytes.
+            (JPEG frame bytes in cycle order, fps).
         """
         resp = await self._http.get(
             f"{self.base_url}/avatars/{avatar_id}/idle_frames",
             params={"max_frames": max_frames},
+            timeout=120.0,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -175,8 +188,9 @@ class FaceAnimationClient:
         for b64_frame in data.get("frames", []):
             frames.append(base64.b64decode(b64_frame))
 
-        logger.info("Got %d idle frames for avatar '%s'", len(frames), avatar_id)
-        return frames
+        fps = int(data.get("fps", 25))
+        logger.info("Got %d idle frames (%d fps) for avatar '%s'", len(frames), fps, avatar_id)
+        return frames, fps
 
     async def close(self) -> None:
         """Close the HTTP client."""

@@ -70,6 +70,7 @@ class AnimationSession:
     session_id: str
     avatar: AvatarData = field(repr=False)
     sample_rate: int = PCM_SAMPLE_RATE
+    start_offset: int = 0
     audio_16k: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.float32), repr=False
     )
@@ -176,7 +177,9 @@ def _render_pending(
         return [], timer.rounded()
 
     pending = chunks[first:last]
-    rendered = render_frames(session.avatar, pending, session.next_frame_idx, models, timer)
+    rendered = render_frames(
+        session.avatar, pending, session.start_offset + session.next_frame_idx, models, timer
+    )
     session.next_frame_idx = window_start + last
 
     encoded: list[tuple[int, str]] = []
@@ -264,10 +267,17 @@ async def prepare_avatar(
 async def start_session(
     avatar_id: str = Form("default"),
     sample_rate: int = Form(PCM_SAMPLE_RATE),
+    start_offset: int = Form(0),
 ) -> dict:
-    """Open a streaming animation session fed with PCM at sample_rate."""
+    """Open a streaming animation session fed with PCM at sample_rate.
+
+    start_offset is the client's current position in the shared ping-pong
+    frame cycle, so speaking continues the idle motion seamlessly.
+    """
     if sample_rate <= 0:
         raise HTTPException(status_code=400, detail=f"Invalid sample_rate: {sample_rate}")
+    if start_offset < 0:
+        raise HTTPException(status_code=400, detail=f"Invalid start_offset: {start_offset}")
     avatar = _avatars.get(avatar_id)
     if avatar is None:
         raise HTTPException(
@@ -281,9 +291,12 @@ async def start_session(
 
     session_id = str(uuid.uuid4())
     _sessions[session_id] = AnimationSession(
-        session_id=session_id, avatar=avatar, sample_rate=sample_rate
+        session_id=session_id, avatar=avatar, sample_rate=sample_rate,
+        start_offset=start_offset,
     )
-    logger.info("Session %s started for avatar '%s'", session_id, avatar_id)
+    logger.info(
+        "Session %s started for avatar '%s' (offset=%d)", session_id, avatar_id, start_offset
+    )
     return {"session_id": session_id, "avatar_id": avatar_id}
 
 
@@ -334,15 +347,27 @@ async def end_session(session_id: str) -> dict:
 
 
 @app.get("/avatars/{avatar_id}/idle_frames")
-async def get_idle_frames(avatar_id: str, max_frames: int = 30) -> dict:
-    """Return evenly sampled reference frames for client-side idle animation."""
+async def get_idle_frames(avatar_id: str, max_frames: int = 0) -> dict:
+    """Return reference frames for the client-side idle loop.
+
+    max_frames=0 (default) returns every frame in order at the live frame
+    rate, so the client can run one continuous ping-pong cycle across idle
+    and speaking; a positive value returns an evenly sampled subset.
+    """
     avatar = _avatars.get(avatar_id)
     if avatar is None:
         raise HTTPException(status_code=404, detail=f"Avatar '{avatar_id}' not found")
 
-    step = max(1, avatar.frame_count // max_frames)
+    if max_frames > 0:
+        step = max(1, avatar.frame_count // max_frames)
+        selected = avatar.frames[::step][:max_frames]
+        fps = 5
+    else:
+        selected = avatar.frames
+        fps = 25
+
     encoded = []
-    for frame in avatar.frames[::step][:max_frames]:
+    for frame in selected:
         jpeg = encode_jpeg(frame)
         if jpeg is not None:
             encoded.append(base64.b64encode(jpeg).decode("ascii"))
@@ -350,6 +375,6 @@ async def get_idle_frames(avatar_id: str, max_frames: int = 30) -> dict:
     return {
         "avatar_id": avatar_id,
         "frame_count": len(encoded),
-        "fps": 5,
+        "fps": fps,
         "frames": encoded,
     }
