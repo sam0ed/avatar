@@ -15,6 +15,7 @@ REFERENCES_DIR = Path(os.environ.get("REFERENCES_DIR", "/app/references"))
 CHANNELS = 1
 SAMPLE_WIDTH = 2
 MIN_CHUNK_SECONDS = 0.1
+MAX_REFERENCES = int(os.environ.get("HIGGS_MAX_REFERENCES", "1"))
 
 SYNTHESIS_PARAMS = {
     "voice": "default",
@@ -79,11 +80,15 @@ class OpenAIAudioEngine:
         return self._reference_id
 
     def set_reference_id(self, ref_id: str) -> None:
-        self._references = load_reference_pairs(self._references_dir / ref_id)
+        pairs = load_reference_pairs(self._references_dir / ref_id)
+        # Higgs is trained for a single short reference (official guidance: one
+        # 3-30s clean sample); measured on 2x4090: 5 references trigger runaway
+        # generation on ~25% of closing-phrase sentences, 1 reference on 0/55.
+        self._references = pairs[:MAX_REFERENCES]
         self._reference_id = ref_id
         logger.info(
-            "Voice cloning enabled: ref_id='%s', %d reference pairs",
-            ref_id, len(self._references),
+            "Voice cloning enabled: ref_id='%s', using %d of %d reference pairs",
+            ref_id, len(self._references), len(pairs),
         )
 
     def clear_reference_id(self) -> None:
