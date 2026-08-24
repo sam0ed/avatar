@@ -76,7 +76,7 @@ def build_onstart_cmd() -> str:
         " --index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"
         " --extra-index-url https://pypi.org/simple",
         # 3. Clone repo
-        f"git clone --depth 1 {GITHUB_REPO} /tmp/av",
+        f"rm -rf /tmp/av && git clone --depth 1 {GITHUB_REPO} /tmp/av",
         # 4. Copy configs + code
         "cp /tmp/av/docker/supervisord.conf /etc/supervisor/conf.d/avatar.conf"
         " && cp /tmp/av/docker/entrypoint_stage2.sh /app/"
