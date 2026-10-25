@@ -36,6 +36,7 @@ from musetalk_audio import (
     window_chunks,
 )
 from musetalk_avatar import AvatarData, build_avatar, load_cached_avatars
+from musetalk_blend import build_blend_material
 from musetalk_models import MuseTalkModels, load_models
 from musetalk_profiling import StageTimer
 from musetalk_render import CPU_POOL, encode_jpeg, render_frames
@@ -118,6 +119,8 @@ async def lifespan(app: FastAPI):
     AVATARS_DIR.mkdir(parents=True, exist_ok=True)
     _models = await run_in_threadpool(load_models)
     _avatars.update(await run_in_threadpool(load_cached_avatars, AVATARS_DIR))
+    for avatar in _avatars.values():
+        avatar.blend = await run_in_threadpool(build_blend_material, avatar, _models.device)
     if _avatars:
         first_avatar = next(iter(_avatars.values()))
         await run_in_threadpool(_warm_render_path, _models, first_avatar)
@@ -253,6 +256,7 @@ async def prepare_avatar(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    avatar.blend = await run_in_threadpool(build_blend_material, avatar, models.device)
     _avatars[avatar_id] = avatar
     if not _render_warmed:
         await _run_on_gpu(_warm_render_path, models, avatar)

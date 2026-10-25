@@ -19,13 +19,16 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
 import torch
 
 from musetalk_models import CACHE_VERSION, STREAM_HEIGHT, MuseTalkModels
+
+if TYPE_CHECKING:
+    from musetalk_blend import FacePatch
 
 logger = logging.getLogger("avatar.face.avatar")
 
@@ -46,6 +49,7 @@ class AvatarData:
     latents: list[Any] = field(repr=False)
     masks: list[np.ndarray] = field(repr=False)
     crop_boxes: list[Any] = field(repr=False)
+    blend: "list[FacePatch | None] | None" = field(default=None, repr=False)
 
     @property
     def frame_count(self) -> int:

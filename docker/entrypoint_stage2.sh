@@ -32,7 +32,12 @@ elif [ "$GPU_COUNT" -eq 2 ]; then
 else
     export LLM_GPU="${LLM_GPU:-0}" TTS_GPU="${TTS_GPU:-0}" FACE_GPU="${FACE_GPU:-0}"
 fi
-echo "GPU placement: count=${GPU_COUNT} llm=${LLM_GPU} tts=${TTS_GPU} face=${FACE_GPU}"
+if [ "${FACE_ENABLED:-false}" = "true" ] && [ "$TTS_GPU" = "$FACE_GPU" ] && [ "$TTS_ENGINE" = "higgs" ]; then
+    export MPS_ENABLED="${MPS_ENABLED:-true}" TTS_MPS_PCT="${TTS_MPS_PCT:-30}"
+else
+    export MPS_ENABLED="${MPS_ENABLED:-false}" TTS_MPS_PCT="${TTS_MPS_PCT:-100}"
+fi
+echo "GPU placement: count=${GPU_COUNT} llm=${LLM_GPU} tts=${TTS_GPU} face=${FACE_GPU} mps=${MPS_ENABLED} tts_mps_pct=${TTS_MPS_PCT}"
 
 # VRAM preflight: sum known footprints per assigned GPU against the hardware,
 # so an impossible configuration refuses at boot instead of OOMing mid-turn.
@@ -219,7 +224,7 @@ fi
 set -e
 
 # --- 4. Prepare directories ---
-mkdir -p /app/references /app/avatars /var/log/supervisor
+mkdir -p /app/references /app/avatars /var/log/supervisor /tmp/nvidia-mps /tmp/nvidia-log
 
 # --- 4.5. Repair the driver loader path ---
 # Some Vast hosts mount only the versioned libcuda without the .so.1 alias;

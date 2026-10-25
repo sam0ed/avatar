@@ -1,2 +1,6 @@
 config_cls: HiggsTtsPipelineConfig
 model_path: bosonai/higgs-tts-3-4b
+runtime_overrides:
+  vocoder:
+    stream_stride: 28
+    stream_followup_stride: 25

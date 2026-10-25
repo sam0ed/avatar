@@ -10,6 +10,7 @@ import torch
 
 from frame_cycle import pingpong_index
 from musetalk_avatar import AvatarData
+from musetalk_blend import blend_batch, decode_faces
 from musetalk_models import MuseTalkModels
 from musetalk_profiling import StageTimer
 
@@ -35,31 +36,6 @@ def encode_jpeg(frame: np.ndarray, quality: int = JPEG_QUALITY) -> bytes | None:
         frame = cv2.resize(frame, (WIRE_MAX_WIDTH, height), interpolation=cv2.INTER_AREA)
     ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buffer.tobytes() if ok else None
-
-
-def _blend_into_frame(
-    avatar: AvatarData,
-    frame_index: int,
-    generated_face: np.ndarray,
-) -> np.ndarray | None:
-    """Paste a generated mouth region back into its original frame."""
-    from musetalk.utils.blending import get_image_blending
-
-    idx = pingpong_index(frame_index, avatar.frame_count)
-    x1, y1, x2, y2 = avatar.coords[idx]
-    try:
-        resized = cv2.resize(generated_face.astype(np.uint8), (x2 - x1, y2 - y1))
-    except (cv2.error, ValueError):
-        logger.warning("Skipped frame %d: bad face box %s", frame_index, avatar.coords[idx])
-        return None
-
-    return get_image_blending(
-        avatar.frames[idx].copy(),
-        resized,
-        [x1, y1, x2, y2],
-        avatar.masks[idx],
-        avatar.crop_boxes[idx],
-    )
 
 
 def _latents_for(avatar: AvatarData, start_index: int, count: int) -> list:
@@ -104,17 +80,9 @@ def render_frames(
                     latent_batch, timesteps, encoder_hidden_states=audio_features
                 ).sample
             with timer.stage("vae"):
-                recon = models.vae.decode_latents(predicted.to(dtype=models.vae.vae.dtype))
-
-        with timer.stage("blend"):
-            batch_first_index = start_index + produced
-            produced += len(recon)
-            blended_batch = CPU_POOL.map(
-                lambda item: _blend_into_frame(avatar, batch_first_index + item[0], item[1]),
-                enumerate(recon),
-            )
-            for offset, blended in enumerate(blended_batch):
-                if blended is not None:
-                    frames.append((batch_first_index + offset, blended))
+                faces = decode_faces(models, predicted)
+            with timer.stage("blend"):
+                frames.extend(blend_batch(avatar, faces, start_index + produced))
+                produced += len(faces)
 
     return frames
