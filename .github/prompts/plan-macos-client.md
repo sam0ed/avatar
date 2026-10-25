@@ -1,6 +1,6 @@
 # Design: The Client Runs on macOS (Meeting Project 1 of 3)
 
-Status: proposed, not implemented
+Status: implemented 2026-10-25 (see AGENTS.md)
 Date: 2026-10-25
 
 ## Objective

@@ -38,6 +38,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from asr.transcriber import SpeechTranscriber
+from audio.echo_cancellation import build_voice_processing, start_voice_processing, uses_voice_processing
 from audio.playback import AudioPlayer
 
 logger = logging.getLogger("avatar.voice_client")
@@ -82,6 +83,7 @@ class VoiceClient:
         language: str = "en",
         device: int | str | None = None,
         use_smart_turn: bool = True,
+        echo_cancellation: bool = True,
     ) -> None:
         """Initialize voice client.
 
@@ -95,8 +97,13 @@ class VoiceClient:
         self.server_url = server_url
         self.play_audio = play_audio
         self._ws: ClientConnection | None = None
-        self._transcriber = SpeechTranscriber(language=language, device=device)
-        self._player = AudioPlayer()
+        voice_processing = uses_voice_processing(echo_cancellation, meeting_audio=False)
+        self._transcriber = SpeechTranscriber(language=language, device=device, external_source=voice_processing)
+        self._voice_io = None
+        if voice_processing:
+            self._voice_io, self._player = build_voice_processing(self._transcriber.push_audio, device)
+        else:
+            self._player = AudioPlayer()
         self._running = False
         self._use_smart_turn = use_smart_turn
         self._smart_turn = None  # SmartTurnAnalyzer, initialized in run()
@@ -498,6 +505,9 @@ class VoiceClient:
         print("Speak into your microphone. Press Ctrl+C to exit.")
         print("Type 'quit' and Enter to exit.\n")
 
+        if self._voice_io is not None:
+            await start_voice_processing(self._voice_io, self._transcriber)
+
         # Start mic capture
         self._transcriber.start()
 
@@ -558,6 +568,8 @@ class VoiceClient:
         finally:
             self._running = False
             quit_task.cancel()
+            if self._voice_io is not None:
+                self._voice_io.stop()
             self._transcriber.close()
             if self._ws:
                 await self._ws.close()
@@ -610,6 +622,12 @@ def main() -> None:
         action="store_true",
         help="Disable Smart Turn end-of-turn detection",
     )
+    parser.add_argument(
+        "--no-aec",
+        action="store_true",
+        help="Turn off echo cancellation (on macOS: plain sounddevice capture and playback "
+        "instead of Apple voice processing; Windows never adds one)",
+    )
     args = parser.parse_args()
 
     client = VoiceClient(
@@ -618,6 +636,7 @@ def main() -> None:
         language=args.language,
         device=args.device,
         use_smart_turn=not args.no_smart_turn,
+        echo_cancellation=not args.no_aec,
     )
 
     try:

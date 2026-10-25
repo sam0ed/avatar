@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python>=4.8,<5",
     "ormsgpack>=1.5,<2",
     "pyaudiowpatch>=0.2.12.8; sys_platform == 'win32'",
+    "pyobjc-framework-AVFoundation>=12.2.2,<13; sys_platform == 'darwin'",
     "pyvirtualcam>=0.15.0",
     "scipy>=1.17.1",
     "sounddevice>=0.5,<1",

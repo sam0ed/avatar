@@ -40,6 +40,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from asr.transcriber import SpeechTranscriber
+from audio.echo_cancellation import build_voice_processing, start_voice_processing, uses_voice_processing
 from audio.playback import AudioPlayer
 from video.display import VideoDisplay
 
@@ -111,13 +112,15 @@ class FaceVoiceClient:
         use_smart_turn: bool = True,
         meeting: bool = False,
         ears: str = "mic",
+        echo_cancellation: bool = True,
     ) -> None:
         """Initialize face voice client; meeting=True routes A/V to virtual devices."""
         self.server_url = server_url
         self.play_audio = play_audio
         self._ws: ClientConnection | None = None
+        voice_processing = uses_voice_processing(echo_cancellation, meeting_audio=meeting or ears == "meeting")
         self._transcriber = SpeechTranscriber(
-            language=language, device=device, external_source=(ears == "meeting")
+            language=language, device=device, external_source=(ears == "meeting" or voice_processing)
         )
         self._ears = None
         if ears == "meeting":
@@ -137,7 +140,11 @@ class FaceVoiceClient:
                 on_mode_change=self._on_output_mode_change,
             )
             self._output_mode_cls = OutputMode
-        self._player = AudioPlayer(output_device=output_device)
+        self._voice_io = None
+        if voice_processing:
+            self._voice_io, self._player = build_voice_processing(self._transcriber.push_audio, device)
+        else:
+            self._player = AudioPlayer(output_device=output_device)
         self._loop = asyncio.new_event_loop()
         self._video_display = VideoDisplay(
             audio_position=lambda: self._player.played_seconds,
@@ -638,6 +645,9 @@ class FaceVoiceClient:
             print("\033[96m[Meeting mode: virtual camera + VB-Cable active; "
                   "press 'a' in the video window to toggle avatar/me]\033[0m")
 
+        if self._voice_io is not None:
+            await start_voice_processing(self._voice_io, self._transcriber)
+
         # Start audio capture (microphone, or system loopback in meeting mode)
         self._transcriber.start()
         if self._ears is not None:
@@ -697,6 +707,8 @@ class FaceVoiceClient:
                 self._ears.stop()
             if self._router is not None:
                 self._router.stop()
+            if self._voice_io is not None:
+                self._voice_io.stop()
             self._transcriber.close()
             self._video_display.stop()
             if self._ws:
@@ -759,6 +771,12 @@ def main() -> None:
         help="What the avatar listens to: your mic, or the meeting via system "
         "loopback (default: meeting when --meeting is set, mic otherwise)",
     )
+    parser.add_argument(
+        "--no-aec",
+        action="store_true",
+        help="Turn off echo cancellation (on macOS: plain sounddevice capture and playback "
+        "instead of Apple voice processing; never used in meeting mode or on Windows)",
+    )
     args = parser.parse_args()
 
     ears = args.ears or ("meeting" if args.meeting else "mic")
@@ -770,6 +788,7 @@ def main() -> None:
         use_smart_turn=not args.no_smart_turn,
         meeting=args.meeting,
         ears=ears,
+        echo_cancellation=not args.no_aec,
     )
 
     try:
