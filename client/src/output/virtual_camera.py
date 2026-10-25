@@ -60,7 +60,8 @@ class VirtualCameraSink:
                 while self._running:
                     frame = self._get_frame()
                     if frame is not None:
-                        cam.send(cv2.cvtColor(self._compose(frame), cv2.COLOR_BGR2RGB))
+                        self._compose(frame)
+                    cam.send(cv2.cvtColor(self._canvas, cv2.COLOR_BGR2RGB))
                     cam.sleep_until_next_frame()
         except Exception:
             logger.exception("Virtual camera stopped unexpectedly")

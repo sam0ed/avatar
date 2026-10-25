@@ -8,15 +8,16 @@ participant's microphone back to them.
 """
 
 import logging
+import sys
 import threading
 from collections.abc import Callable
 
 import numpy as np
-import pyaudiowpatch
 from scipy.signal import resample_poly
 
 logger = logging.getLogger("avatar.output.ears")
 
+MACOS = "darwin"
 ASR_SAMPLE_RATE = 16_000
 ASR_BLOCK_SAMPLES = 1600
 
@@ -45,36 +46,51 @@ class MeetingEars:
 
     def _loop(self) -> None:
         try:
-            with pyaudiowpatch.PyAudio() as audio:
-                device = audio.get_default_wasapi_loopback()
-                rate = int(device["defaultSampleRate"])
-                channels = int(device["maxInputChannels"])
-                logger.info(
-                    "Meeting ears on '%s' (%d Hz, %d ch)", device["name"], rate, channels
-                )
-                stream = audio.open(
-                    format=pyaudiowpatch.paInt16,
-                    channels=channels,
-                    rate=rate,
-                    frames_per_buffer=rate // 10,
-                    input=True,
-                    input_device_index=device["index"],
-                )
-                try:
-                    while self._running:
-                        raw = stream.read(rate // 10, exception_on_overflow=False)
-                        self._ingest(raw, rate, channels)
-                finally:
-                    stream.stop_stream()
-                    stream.close()
+            self._capture()
         except Exception:
             logger.exception("Meeting ears stopped unexpectedly")
         finally:
             self._running = False
 
+    def _capture(self) -> None:
+        if sys.platform == MACOS:
+            from output.system_audio_tap import capture_system_audio
+
+            capture_system_audio(self._ingest_mono, lambda: self._running)
+        else:
+            self._capture_wasapi()
+
+    def _capture_wasapi(self) -> None:
+        import pyaudiowpatch
+
+        with pyaudiowpatch.PyAudio() as audio:
+            device = audio.get_default_wasapi_loopback()
+            rate = int(device["defaultSampleRate"])
+            channels = int(device["maxInputChannels"])
+            logger.info(
+                "Meeting ears on '%s' (%d Hz, %d ch)", device["name"], rate, channels
+            )
+            stream = audio.open(
+                format=pyaudiowpatch.paInt16,
+                channels=channels,
+                rate=rate,
+                frames_per_buffer=rate // 10,
+                input=True,
+                input_device_index=device["index"],
+            )
+            try:
+                while self._running:
+                    raw = stream.read(rate // 10, exception_on_overflow=False)
+                    self._ingest(raw, rate, channels)
+            finally:
+                stream.stop_stream()
+                stream.close()
+
     def _ingest(self, raw: bytes, rate: int, channels: int) -> None:
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        mono = samples.reshape(-1, channels).mean(axis=1)
+        self._ingest_mono(samples.reshape(-1, channels).mean(axis=1), rate)
+
+    def _ingest_mono(self, mono: np.ndarray, rate: int) -> None:
         resampled = resample_poly(mono, ASR_SAMPLE_RATE, rate).astype(np.float32)
         self._pending = np.concatenate([self._pending, resampled])
         while len(self._pending) >= ASR_BLOCK_SAMPLES:
