@@ -15,6 +15,7 @@ env/
 
 # uv
 uv.lock
+!client/uv.lock
 
 # Models (downloaded at runtime)
 models/
