@@ -6,7 +6,7 @@ Real-time digital avatar clone: captures the user's voice via microphone, genera
 
 ## Architecture
 
-- **Local machine**: Windows, RTX 3060 6GB laptop. Runs orchestrator, ASR (faster-whisper), VAD (Silero), virtual camera/mic output.
+- **Local machine (client)**: must run on both Windows and macOS. Development moved to a macOS machine (Apple M5, 16 GB, macOS 27) on 2026-10-25; Windows stays supported but is not being smoke-tested for now. **The macOS port is not done** — the client does not yet install or run on macOS (see Current Stage). All client work up to 2026-08-24 was developed on a Windows laptop (RTX 3060 6GB). The client runs ASR + VAD (Moonshine Voice, CPU), Smart Turn end-of-turn detection, audio playback, the OpenCV video window and, in meeting mode, the virtual camera/mic output and system-loopback capture.
 - **Remote GPU**: Vast.ai, RTX 4090 24GB (Linux). Runs LLM, TTS, face animation. Docker-based deployment.
 - **Communication**: WebSocket (binary/msgpack) between local client and Vast.ai server.
 
@@ -17,13 +17,14 @@ Real-time digital avatar clone: captures the user's voice via microphone, genera
 | Package manager | **uv** (NOT pip, NOT conda) |
 | Python version | 3.11 |
 | LLM | MamayLM (Gemma 2 9B, GGUF Q4_K_M) via llama-cpp-python |
-| TTS / Voice clone | OpenAudio S1-mini (Fish Speech successor, 0.5B) |
-| ASR | faster-whisper large-v3-turbo + Silero VAD |
+| TTS / Voice clone | OpenAudio S1-mini (Fish Speech successor, 0.5B) — default, `TTS_ENGINE=fish`; or Higgs Audio v3 (`bosonai/higgs-tts-3-4b` via sglang-omni), `TTS_ENGINE=higgs` |
+| ASR | Moonshine Voice (VAD + ASR, CPU) + Smart Turn v3.2 end-of-turn detection |
 | Face animation | MuseTalk |
 | Server framework | FastAPI + WebSocket |
 | Local orchestrator | Python asyncio + websockets |
 | Virtual camera | pyvirtualcam + OBS Virtual Camera |
 | Virtual microphone | VB-Audio Virtual Cable + sounddevice |
+| Meeting audio capture | pyaudiowpatch (WASAPI system loopback; no macOS wheel) |
 | Containerization | Docker (python:3.11-slim-bookworm base) |
 | GPU hosting | Vast.ai (CLI: `uv tool install vastai`) |
 | Vast.ai CLI docs | https://docs.vast.ai/api-reference/commands |
@@ -36,50 +37,84 @@ avatar/
 ├── AGENTS.md                 # This file — project memory
 ├── .github/
 │   ├── copilot-instructions.md   # Coding conventions (always-on)
-│   └── prompts/
-│       └── plan-digitalAvatarClone.prompt.md  # Master build plan
+│   ├── prompts/
+│   │   ├── plan-digitalAvatarClone.prompt.md  # Master build plan
+│   │   └── plan-pluggable-tts.md              # Pluggable-TTS design (its own steps 1–5)
+│   └── workflows/
+│       └── build-stage4-image.yml  # Builds ghcr.io/sam0ed/avatar-stage4
 ├── server/                   # Vast.ai server code
 │   ├── pyproject.toml        # uv-managed dependencies
+│   ├── tests/                # pytest: TTS engine contract, Higgs adapter, resample groups, ping-pong
 │   └── src/
+│       ├── main.py           # Stage 0 entry point: runs uvicorn on src.api.server:app
 │       ├── llm/
 │       │   ├── client.py         # Async LLM client (OpenAI-compat SSE streaming)
 │       │   ├── chunker.py        # Sentence boundary detection for streaming TTS
 │       │   └── system_prompt.txt # System prompt (placeholder)
 │       ├── tts/
-│       │   └── client.py         # Async Fish Speech TTS client
+│       │   ├── engine.py                # TTSEngine protocol, engine registry (TTS_ENGINE), WAV framing
+│       │   ├── engine_fish_speech.py    # Fish Speech (S1-mini) adapter, raw PCM
+│       │   └── engine_openai_audio.py   # OpenAI /v1/audio/speech adapter (Higgs via sglang-omni)
 │       ├── face/                 # MuseTalk service — copied into /opt/musetalk at boot
 │       │   ├── client.py             # Async client the orchestrator talks to
 │       │   ├── face_server.py        # FastAPI service on :8002, sessions
+│       │   ├── frame_cycle.py        # pingpong_index (server side; client/src/video/display.py keeps an identical copy)
 │       │   ├── musetalk_models.py    # Weight loading, output config
 │       │   ├── musetalk_avatar.py    # Reference video → frames/latents/masks + disk cache
 │       │   ├── musetalk_audio.py     # PCM → sliding-window whisper chunks
+│       │   ├── musetalk_profiling.py # CUDA-synced per-stage timer
 │       │   └── musetalk_render.py    # Batched UNet + VAE + blending → JPEG
 │       └── api/
 │           └── server.py     # FastAPI + WebSocket, decoupled A/V pipeline
-├── client/                   # Local Windows client
+├── client/                   # Local client (Windows; macOS port not done)
 │   ├── pyproject.toml        # uv-managed dependencies
+│   ├── test_llm_client.py    # Debug, legacy: LLM streaming against a hardcoded Feb 2026 instance IP
+│   ├── test_ws.py            # Debug, legacy: direct LLM, WebSocket ping and chat against a hardcoded Feb 2026 instance
 │   └── src/
 │       ├── asr/
-│       │   ├── transcriber.py     # Moonshine Voice ASR wrapper (VAD+ASR, CPU)
+│       │   ├── transcriber.py     # Moonshine Voice ASR wrapper (VAD+ASR, CPU); mic or pushed audio
 │       │   └── smart_turn.py      # Smart Turn v3.2 ONNX end-of-turn detector
 │       ├── audio/
 │       │   └── playback.py        # Audio player with pause/resume/cancel
 │       ├── video/
 │       │   └── display.py         # OpenCV window, live + idle playback
+│       ├── output/                # Meeting mode (--meeting, --ears)
+│       │   ├── devices.py             # Finds the VB-Cable playback device
+│       │   ├── router.py              # Avatar/me switchboard behind the 'a' toggle
+│       │   ├── virtual_camera.py      # Frames → OBS Virtual Camera at a fixed rate
+│       │   ├── webcam_source.py       # Real webcam passthrough when toggled to me
+│       │   ├── mic_passthrough.py     # Real mic → VB-Cable when toggled to me
+│       │   └── meeting_ears.py        # WASAPI system loopback → ASR (pyaudiowpatch)
 │       ├── voice_client.py        # Voice-only conversation client
 │       ├── face_voice_client.py   # Voice + face conversation client
 │       ├── chat_client.py         # Terminal chat client with audio playback
+│       ├── orchestrator.py        # Legacy: Stage 0–3 state-machine skeleton; the real clients are above
+│       ├── connectivity_test.py   # Stage 0 WebSocket ping/RTT test
+│       ├── latency_test.py        # Debug: one chat message to ws://localhost:8000, first-token/first-audio timing
 │       └── tts_test.py            # Fish Speech TTS test client
 ├── scripts/
 │   ├── deploy_tts.py         # Deploy Fish Speech to Vast.ai (Stage 1)
 │   ├── deploy_stage2.py      # Deploy audio-only pipeline to Vast.ai
-│   ├── deploy_face.py        # Deploy with FACE_ENABLED=true (Stage 4)
+│   ├── deploy_face.py        # Deploy with FACE_ENABLED=true (Stage 4), --tts-engine fish|higgs
+│   ├── bench_face_profile.py # Per-stage face benchmark
 │   ├── setup_voice.py        # Upload voice references + enable cloning
-│   └── setup_face.py         # Upload reference video + enable face
+│   ├── setup_face.py         # Upload reference video + enable face
+│   └── update_tts_compile.sh # Legacy, temporary (Stage 2): patched a running instance's TTS program for COMPILE=1
 ├── docker/
+│   ├── .dockerignore         # Ignore list for server image builds
 │   ├── Dockerfile            # Stage 0 orchestrator container (slim)
+│   ├── Dockerfile.stage2     # Legacy: Stage 2 custom image, abandoned for git clone, kept for reference
+│   ├── build.sh              # Stage 0: build + push the avatar-server image
+│   ├── deploy_vastai.sh      # Stage 0: create a Vast.ai instance from a Docker Hub image
+│   ├── Dockerfile.stage4     # Stage 4 image (fish-speech base pinned by digest; fish, LLM, MuseTalk, higgs venvs)
 │   ├── supervisord.conf      # Process manager config (LLM, TTS, musetalk, orchestrator)
-│   └── entrypoint_stage2.sh  # Model download + venv setup + supervisord start
+│   ├── entrypoint_stage2.sh  # Model download + venv setup + supervisord start
+│   ├── start_tts.sh          # Starts fish or higgs on :8080 by TTS_ENGINE
+│   ├── higgs_4090.yaml       # sglang-omni pipeline config for Higgs
+│   ├── higgs-requirements.in # higgs venv inputs
+│   ├── higgs-lock.txt        # uv pip compile lock of those inputs, installed into /opt/higgs-venv
+│   ├── patches/              # fish-speech-streaming.patch (incremental decode + KV reuse + EFFICIENT_ATTENTION decode)
+│   └── musetalk-freeze.txt   # Known-good MuseTalk venv freeze
 ├── docs/                     # Research notes (untracked, local only)
 ├── video/                    # Reference video for face animation (gitignored)
 ├── recordings/               # Voice samples for cloning (gitignored)
@@ -142,17 +177,38 @@ avatar/
 
 ## Current Stage
 
-**Stage 4: Face Animation (MuseTalk 1.5)** — REWRITTEN, NOT YET RUN
+**Meeting integration (Google Meet)** — partly built and run on Windows only; no commit records an
+end-to-end run in a meeting (the daybook mentions a live Meet test on 2026-08-24); the client does not yet
+install or run on macOS, the current development machine.
 
-The face service has been rebuilt against MuseTalk's real API and split into `musetalk_models.py`,
-`musetalk_avatar.py`, `musetalk_audio.py`, `musetalk_render.py` and `face_server.py` under `server/src/face/`.
-It has still **never been executed** — no instance has been deployed with `FACE_ENABLED=true`. Treat the first
-deploy as the verification step for the whole stage, not as a routine boot.
+Naming hazard: the master plan calls meeting work "Stage 5: Zoom Integration", while the 2026-08-23 Progress
+Log rows (and commit `ed7f02f`, "Stage 5 verified") use "stage 1–5" for the steps of
+`.github/prompts/plan-pluggable-tts.md`, a different numbering — so "Stage 5" alone is ambiguous in this file.
 
-Stage 3 (speech-to-speech with barge-in) is complete and verified in real spoken conversations, and is
-unaffected by any of the above: face animation is gated behind `FACE_ENABLED` at five points (deploy script,
-entrypoint, supervisord `autostart`, orchestrator import, and a per-turn `_active_avatar_id` check), and the
-entrypoint's face block is non-fatal, so `deploy_stage2.py` cannot reach face code at all.
+- **Stages 0–3** of the master plan are complete and verified (Progress Log, 2026-02-15 to 2026-03-08).
+- **Stage 4 (face animation, MuseTalk 1.5)** has been verified working since 2026-08-16 (instance 47877527)
+  and renders in real time since 2026-08-23. For the idle/speech ping-pong frame cycle added on 2026-08-24
+  (`dccea9b`, `9ea34d8`, `c50b588`, `4573042`): only the server-side `pingpong_index` has unit tests
+  (`dccea9b`); the boot-copy fix (`9ea34d8`) was checked live by restarting musetalk; no commit records a
+  live run of the client side.
+- **TTS is pluggable**: fish (OpenAudio S1-mini, the default) or Higgs Audio v3, chosen per deploy with
+  `TTS_ENGINE`; both verified end to end on 2×4090 on 2026-08-23. `151b98c` (2026-08-24) later made a
+  single Higgs reference the default (`HIGGS_MAX_REFERENCES=1`); no run of that default is recorded.
+- **Meeting work so far** (2026-08-24, Windows): `--meeting` on the face client routes the avatar's frames to
+  the OBS Virtual Camera and its speech to VB-Cable, with an avatar/me toggle (`be7a119`, `45f15f9`);
+  `--ears meeting` feeds WASAPI system loopback into the ASR (`33517d1`). Verified: the virtual camera with a
+  3s synthetic stream, and loopback capture. Not yet run: the VB-Cable path and a full meeting conversation.
+  All of it routes A/V through virtual devices on the user's own machine; nothing in the repo joins a
+  meeting as a separate participant.
+- **Goal (confirmed 2026-10-25)**: Google Meet is the single target platform, in two modes — "as me" (the
+  avatar appears in the meeting under the user's own account, replacing their camera and mic) and "as a
+  participant" (the avatar joins as its own participant, so everyone, including the user, can talk to it).
+  Design for both modes and for the macOS port is not recorded here yet.
+- **Platform**: development moved to macOS (Apple M5, 16 GB, macOS 27) on 2026-10-25. Windows must stay
+  supported but is not being smoke-tested for now. The client does not yet install or run on macOS:
+  `uv sync` fails because `pyaudiowpatch` has no macOS wheel, and the OpenCV display window crashes when it
+  is created off the main thread on macOS. Nothing has been built for macOS yet.
+- **Server**: at `33517d1` no instance was running ("the server is powered down, verify on next deploy").
 
 ## Progress Log
 
@@ -188,10 +244,18 @@ entrypoint's face block is non-fatal, so `deploy_stage2.py` cannot reach face co
 
 | 2026-08-23 | Stage 4 | **Pluggable-TTS stage 5 done — Higgs Audio v3 verified end-to-end on 2×4090 (instance 48498690, Spain, EPYC 9754, driver 580.159).** Engine bench on-box with 5 cloned references, Ukrainian: **first_audio 0.34–0.48s flat**, RTF 0.26–0.40 (15.9s of audio in 4.1s). E2E through the full stack: first_token 0.62s, **first audio 1.34s, first video 2.30s**, 584 frames = 23.36s of video against 23.36s of audio at 24kHz — the sample-rate plumbing is exact through all hops with zero client changes. VRAM: GPU0 = LLM 9.1 + Higgs 12.4 = 21.5/24 GiB, GPU1 = MuseTalk 7.4 GiB. SM89 risk didn't fire: sglang-omni picked flashinfer for all four backends, prebuilt cubins loaded. First boot surfaced five deploy gaps, each fixed at its source: onstart didn't copy `higgs_4090.yaml` (deploy_face.py); `total_gpu_memory_fraction` is a fraction of **free** VRAM at stage load, not of the card — hand-tuned 0.42 died, and the sglang-omni defaults (0.03/0.85/0.10) boot fine beside the LLM, so `stage_overrides` was deleted entirely; SGLang JIT-compiles QK-Norm/fused-RoPE kernels via tvm_ffi at first boot, needing `ninja` on PATH, nvcc via CUDA_HOME (the runtime base has no `/usr/local/cuda/bin/nvcc`), and `libcudart.so`+`lib64` symlinks the cu13 wheel doesn't ship — all wired into start_tts.sh (idempotent) and Dockerfile build checks. |
 | 2026-08-23 | Stage 4 | **Pluggable-TTS stages 1–3 done: engine protocol + registry + raw-PCM contract (stage 1), sample-rate plumbed through all four face hops with a derived resample group (stage 2), fish regression PASSED on hardware (stage 3, instance 48488087, Finland 2×4090/EPYC 9334).** Regression on the new contract: warm first audio 1.22–1.29 s, first video 1.41–1.46 s, **A/V durations exact** (19.97 vs 19.96 s; 36.08 vs 36.08 s), sustained delivery **30.2 fps** over a 36 s reply, avatar prep 85.5 s, engine TTFB flat 0.40/0.66/0.64 s at 7/50/190 chars measured externally. On-box checks (nvidia-smi placement, musetalk-venv resample cross-check) were blocked by a broken vast SSH proxy on that instance; placement is evidenced circumstantially (2×24 GB runs the full stack with cloning and no OOM at 30 fps, impossible on one card). |
+| 2026-08-24 | Stage 4 / deploy | **Host egress root-caused; offer filters and onstart hardened; wire downscale tried and reverted.** `07c80e9` recorded the egress finding as an Important Decisions entry (not as a log row): the Higgs A/V desync on instance 48498690 was the box→client path, 1.8 Mbit/s — "Measured live on instance 48498690 before teardown". `7c86454` allows CN hosts in the offer filters of all three deploy scripts (`BLOCKED_REGIONS = {"RU"}`) — "Config-only change, verified by grep". `f65ba7c` makes the onstart clone idempotent (`rm -rf /tmp/av` before `git clone`) after `vastai reboot` re-ran onstart into a stale `/tmp/av` on instance 48538814 and left no services — "verified on the next boot of that instance". `fb050c1` downscaled wire JPEGs to 640px (`FACE_WIRE_MAX_WIDTH`) after a second thin route (Denmark, ~5.5 Mbit/s) — "Not yet run"; `cd06680` set the default back to 0 (full resolution), keeping the variable as an escape hatch and picking hosts by measured egress — "Config-only change", no run recorded. `cd06680` names an H.264 video track as the real fix, "planned separately"; none is committed. The user's daybook adds that a fresh Danish instance booted clean that day with no manual intervention; no commit records it. |
+| 2026-08-24 | Stage 4 | **Client frame buffer, latency stats and barge-in visibility — none verified in a recorded run.** `dfbdb68`: client frame buffer 300 → 3000 frames (2 min at 25fps), because Higgs frames arrive ~42fps against 25fps consumption (measured on a Norway instance) and the 300-frame deque overflowed ~18s into a turn, evicting the frames due next — "Client-only change; verified next in the user's live session." `1af0fdf`: a perceived-latency line in the face client stats (turn-detect, server, playout) next to the old send-to-first-chunk "First audio" — "Syntax-checked only; verified next in the user's live session." `08d2246`: barge-in pause/resume/cancel printed to the console, to test a suspected echo leak of the avatar's own speech into VAD — "Syntax-checked; diagnostic output verified next in the live session." No commit records the results of those sessions; the daybook records that day's diagnosis that the avatar's own Ukrainian speech was tripping the user-speech detector. |
+| 2026-08-24 | Stage 4 | **Higgs uses a single voice reference by default (`151b98c`, `HIGGS_MAX_REFERENCES=1`).** Measured on the Norway 2×4090: with five references Higgs ran away (reference-like content until the token cap) on ~25% of closing-phrase sentences, with one reference on 0/55. Fish keeps its multi-reference setup. The measurement was live; the code change itself: "Unit tests pass; applied to the live instance next" — no later commit records that run. |
+| 2026-08-24 | Stage 4 | **Seamless idle↔speech transitions and a full-cycle idle loop.** `dccea9b`: the client keeps one continuous 25fps ping-pong cursor over the whole avatar frame cycle; idle plays local frames along it, each chat sends the cursor as `start_offset`, the face server renders from there, and `pingpong_index` (new `server/src/face/frame_cycle.py`) replaces the modulo wrap that showed a seam every ~38s of speech. Previously idle was 30 sampled frames at 5fps and speech always restarted at frame 0 — "Unit tests pass (6 new for pingpong_index, 23 total); live-instance verification next." `9ea34d8`: the entrypoint now copies `frame_cycle.py` into `MUSETALK_DIR` (its `musetalk_*.py` glob missed it) — "Verified by restarting musetalk there after the copy" (Norway instance). `c50b588`: client websocket `max_size` raised to 64MB because the 958-frame idle cycle is one ~25MB message; the 1MB default closed the connection and `_load_idle_frames` swallowed it at debug level; the failure now logs a warning — "Syntax-checked; verified next in the user's live session." `4573042`: idle frames stay JPEG-encoded (pre-decoded they held >1GB, paged, stalled the display and caused double-speed catch-up) and a stall resyncs the idle clock — "Syntax-checked; verified next in the user's live session." The daybook describes the transitions as made seamless and the double-speed idle as fixed, and mentions a freshly recorded reference clip (`video/` is gitignored, so git cannot confirm it); no commit records a live result. |
+| 2026-08-24 | Meeting | **Meeting mode: avatar A/V to virtual camera and VB-Cable, with an avatar/me toggle (`be7a119` + `45f15f9`).** `--meeting` on `face_voice_client.py` streams the display's current frame (idle and speech) into the OBS Virtual Camera at 25fps and plays avatar speech into VB-Cable; `a` in the video window toggles to ME, which passes the physical webcam through, copies the real mic into the cable and mutes the ASR. `be7a119` as committed lacked the `client/src/output/` package — the root `.gitignore`'s unanchored `output/` rule swallowed it; `45f15f9` anchored the rule and added the five modules. Verification in `be7a119`: "Virtual camera path verified live (OBS driver present, 3s synthetic stream); VB-Cable path not yet run - the driver install is pending." The daybook says the VB-Cable driver was installed later that day and that a live Google Meet test happened; no commit records either, so the VB-Cable path counts as not run. |
+| 2026-08-24 | Meeting | **Meeting ears: the avatar hears the meeting via WASAPI system loopback (`33517d1`).** `--ears meeting` (the default under `--meeting`) captures the default output device with `pyaudiowpatch`, downmixes and resamples to 16kHz mono and pushes blocks into the transcriber (new `external_source` mode + `push_audio`, `client/src/output/meeting_ears.py`), so remote participants drive the conversation instead of the local mic; meeting apps do not play your own mic back, so self-echo is structurally absent. Verification: "Loopback verified live on this machine (24 blocks of 1600 samples in 2.5s); full meeting conversation not yet run - the server is powered down, verify on next deploy." The daybook says a live Meet test that day exposed two gaps (the meeting's camera toggle was off, and the avatar could not hear a second device), both "resolved by end of day"; the commit is authoritative — a full meeting conversation has not been recorded as run. |
+| 2026-10-25 | Platform / Meeting | **Development moved to macOS; meeting goal stated as two Google Meet modes.** New development machine: Apple M5, 16 GB, macOS 27. The client must keep supporting Windows, but Windows will not be smoke-tested for now. The client does not yet install or run on macOS: `uv sync` fails (`pyaudiowpatch` has no macOS wheel) and the OpenCV display window crashes when created off the main thread on macOS; nothing has been built for macOS. Goal confirmed by the user: Google Meet is the single target platform, in two modes — "as me" (the avatar replaces the user's camera and mic under the user's own account) and "as a participant" (the avatar joins as its own participant so everyone, including the user, can talk to it). Design for both modes and for the macOS port is not recorded here yet. No commits since `33517d1`. |
 
 ## Important Decisions & Context
 
-- **Host egress to the client is the fifth host-lottery dimension, and it is invisible in the offer** — root-caused 2026-08-24 on instance 48498690 (Spain). The user reported "broken A/V alignment on Higgs, fish was fine"; measurement showed it was neither Higgs nor our code: the client drops frames that arrive after `first_audio + frame_idx/25`, and 100% of frames were late (up to +28s) because the video stream needs ~5.2 Mbit/s (25fps × 26KB JPEG) while the box→client path delivered **1.8 Mbit/s** — against an advertised inet_up of 931 Mbit/s and the client's own 48.6 Mbit/s downlink (Cloudflare probe). Same probe over localhost on the box: worst lateness 0.24s; isolated render bench: 32.5 fps with sglang running, zero cgroup throttling. The earlier "fish was fine" comparison ran on a different host whose route delivered 29.3 fps to the same client — engine change coincided with host change. Rule: right after boot, before judging the pipeline, measure real egress with a ~30s scp/curl from the box to the client machine; advertised inet numbers say nothing about the route to you. |: Zen2/Zen3 EPYC hosts die with `Illegal instruction`** — hit live 2026-08-23 on a UK 2×4090 with EPYC 7443P (Zen3): ggml_cuda_init prints its device line, then SIGILL (exit 132) during model load, which supervisord reports only as "exited too quickly". Verified: zero `avx512*` flags in /proc/cpuinfo there; the same wheel runs on EPYC 9754/9334/9B14 (Zen4) and modern Xeons. Host selection rule: cpu_name `EPYC 9xx4`-series or Ice-Lake+ Xeon is safe; `EPYC 7xx2/7xx3` is not. Together with disk_bw (extraction), single-core speed (TTS decode) and a healthy driver mount, this is the fourth host-lottery dimension.
+- **Host egress to the client is the fifth host-lottery dimension, and it is invisible in the offer** — root-caused 2026-08-24 on instance 48498690 (Spain). The user reported "broken A/V alignment on Higgs, fish was fine"; measurement showed it was neither Higgs nor our code: the client drops frames that arrive after `first_audio + frame_idx/25`, and 100% of frames were late (up to +28s) because the video stream needs ~5.2 Mbit/s (25fps × 26KB JPEG) while the box→client path delivered **1.8 Mbit/s** — against an advertised inet_up of 931 Mbit/s and the client's own 48.6 Mbit/s downlink (Cloudflare probe). Same probe over localhost on the box: worst lateness 0.24s; isolated render bench: 32.5 fps with sglang running, zero cgroup throttling. The earlier "fish was fine" comparison ran on a different host whose route delivered 29.3 fps to the same client — engine change coincided with host change. Rule: right after boot, before judging the pipeline, measure real egress with a ~30s scp/curl from the box to the client machine; advertised inet numbers say nothing about the route to you.
+- **The prebuilt llama-cpp-python cu124 wheel requires AVX-512: Zen2/Zen3 EPYC hosts die with `Illegal instruction`** — hit live 2026-08-23 on a UK 2×4090 with EPYC 7443P (Zen3): ggml_cuda_init prints its device line, then SIGILL (exit 132) during model load, which supervisord reports only as "exited too quickly". Verified: zero `avx512*` flags in /proc/cpuinfo there; the same wheel runs on EPYC 9754/9334/9B14 (Zen4) and modern Xeons. Host selection rule: cpu_name `EPYC 9xx4`-series or Ice-Lake+ Xeon is safe; `EPYC 7xx2/7xx3` is not. Together with disk_bw (extraction), single-core speed (TTS decode) and a healthy driver mount, this is the fourth host-lottery dimension.
 - **Some vast hosts mount the driver without the `libcuda.so.1` alias, and the image's CUDA forward-compat lib then breaks everything with Error 804** — hit live the same day, same UK host (driver 565.57, so NOT an old-driver problem: compat libs simply do not support GeForce). `nvidia-smi` keeps working (it skips the loader), which makes the failure look mystifying. The entrypoint now aliases the real versioned libcuda to `.so.1`/`.so`, moves `/usr/local/cuda/compat` aside and runs ldconfig; the old hack's branch that symlinked the CUDA **stub** was removed — a stub libcuda produces this same class of runtime init failure by another route.
 - **After the GPU-side fixes, TTS decode is bound by host-CPU single-core speed, not by the GPU** — established 2026-08-23 on the Spain 2×4090 host. Evidence chain: 55 tok/s there vs 99 on the A6000 despite a faster GPU at 98 % util, full clocks, no throttling; MATH vs EFFICIENT_ATTENTION A/B on that host showed **zero difference** (55.4 vs 55), so attention cost was no longer binding; cudagraphs record and replay (verified via TORCH_LOGS); cgroup quota generous and unthrottled; single-core spin benchmark 143 ms vs ~80–90 ms on fast cores. Conclusion: per-token host-side orchestration (Python loop + dispatch around the graph) costs ~10 ms/token on a fast core and ~18 ms on EPYC 9754-class dense cores, and it scales with CPU clock, not GPU tier. Consequences: (1) host selection for TTS must weigh single-core CPU speed alongside disk_bw — check `cpu_name` in offers; (2) the next software lever is removing per-token Python from the loop (multi-token graph capture), which no GPU upgrade substitutes for. |
 - **Same-seed TTS output is NOT reproducible across process restarts, and decode is not bit-deterministic even within one process** — established 2026-08-23 while validating the streaming patch. Two same-seed runs in one process produced identical lengths but different md5s; the stock (unpatched) path in a fresh process produced a different token count than the same request before the restart. Consequence: wav-diff against a stored reference can never validate a change on this stack; isolate the changed numeric stage and compare it on fixed inputs instead (that is what the SNR 108.8 dB growing-prefix measurement does).
@@ -202,7 +266,7 @@ entrypoint's face block is non-fatal, so `deploy_stage2.py` cannot reach face co
 - **Blackwell (RTX 5090) is blocked by a specific version floor, not by absence of builds** — checked 2026-08-16. Official `mmcv` wheels 404 for cu124/cu126/cu128 (they stop at `cu121/torch2.4.0`) and `llama-cpp-python` stops at `cu125`. Third-party builds do exist — `miropsota.github.io/torch_packages_builder` ships `mmcv==2.2.0+pt2.7.0cu128` — but `mmdet==3.1.0` and `mmpose==1.1.0` require **`mmcv<2.2.0`**, which is exactly where the cu128 build starts, and the community `llama-cpp-python` cu128 wheels are `win_amd64` while we run Linux. Source-building mmcv under CUDA 12.8 is reported to fail at the CUDA extension stage. fish-speech alone is already cu128-ready (its `pyproject.toml` ships `cu128`/`cu129` extras). Note also that `requirements.txt` pins `tensorflow==2.12.0`, which is what forces `numpy<1.24` and hence the fragile 1.23.5 ABI pin — TensorFlow appears unused by this PyTorch model and dropping it would be the first move in any future migration.
 - **First audio is bounded by the LLM's first sentence, not by TTS** — measured 2026-08-16. Across 10 turns, `first_token` was a flat 0.07–0.11s and TTS TTFB was 0.5–0.9s for short text, yet end-to-end first audio ranged 0.73s → 2.47s and tracked **reply length**, not prompt length: a 1.8s reply gave first audio at 0.82s, an 11.8s reply at 2.39s. The orchestrator accumulates tokens until a sentence boundary before dispatching to TTS, so a verbose answer means a long first sentence means late first audio. The highest-leverage latency work is therefore cutting the *first* chunk at a clause/comma boundary and reverting to sentences afterwards — not swapping in a faster engine.
 - **uv everywhere**: Use `uv` for all Python dependency management. `pyproject.toml` for both server/ and client/. No requirements.txt, no pip freeze.
-- **No WSL2**: Everything local runs on native Windows. All dependencies have Windows CUDA wheels.
+- **No WSL2**: Everything local runs on native Windows. All dependencies have Windows CUDA wheels. (Recorded when the Windows laptop was the only local machine. Since 2026-10-25 the client must also run on macOS, where development now happens; that port is not done yet — see Architecture and Current Stage.)
 - **MamayLM over Qwen/Llama**: Chosen for SOTA Ukrainian (outperforms 10x larger models) + strong English from Gemma 2 base.
 - **llama-cpp-python over vLLM**: vLLM GGUF support is "highly experimental and under-optimized" (~30-50 tok/s). llama-cpp-python achieves 120-150 tok/s for Q4_K_M on RTX 4090 with native CUDA backend, OpenAI-compatible API.
 - **GGUF Q4_K_M over AWQ/GPTQ**: No official AWQ/GPTQ quantized MamayLM exists. Self-quantizing has quality verification concerns. Official GGUF quants from INSAIT (Q4_K_M: 5.76GB, Q8_0: 9.83GB as upgrade path).
@@ -218,12 +282,12 @@ entrypoint's face block is non-fatal, so `deploy_stage2.py` cannot reach face co
 - **Turn-taking V2 (Smart Turn — IMPLEMENTED)**: Pipecat Smart Turn v3.2 ONNX model (~8M params, Whisper Tiny backbone, BSD-2-Clause). Runs after Moonshine VAD silence, classifies "complete turn" vs "incomplete turn" on last 8s of audio. ~10-65ms CPU inference. 23 languages incl Ukrainian. Uses `WhisperFeatureExtractor(chunk_length=8)` from `transformers` (no torch required). Model auto-downloaded from `pipecat-ai/smart-turn-v3` on HuggingFace (~8MB, cached). Disableable via `--no-smart-turn` CLI flag. If turn incomplete, waits for more speech (3s timeout fallback).
 - **Barge-in V1 (none)**: Mic muted during PROCESSING/SPEAKING. User must wait for avatar to finish. Avoids echo cancellation complexity.
 - **Barge-in V2a (headphone VAD)**: Keep mic active during playback, use Moonshine VAD to detect user speech. On `line_started` → cancel playback + server task. Requires headphones (no echo). Simplest, most reliable. ~30 lines changed.
-- **Barge-in pre-filters (IMPLEMENTED)**: Three-layer filtering before treating speech as interruption: (1) backchannel regex (mhm, yeah, okay, sure, right, etc.), (2) `MIN_INTERRUPTION_WORDS=2`, (3) `MIN_INTERRUPTION_DURATION=0.5s`. Filtered speech causes zero audio disruption — playback continues uninterrupted, barge-in listener restarts. Pause/resume approach (LiveKit style) deferred — pre-filters handle the common case without any audio glitch.
-- **Barge-in V2b (pause/resume — DEFERRED)**: LiveKit/Pipecat pattern — PAUSE playback on VAD trigger, wait 0.5-1s for ASR to confirm real words. If real speech → fully cancel. If noise/echo → resume playback. Would require `pause()`/`resume()` in AudioPlayer. Not needed with current pre-filter approach.
+- **Barge-in pre-filters (IMPLEMENTED 2026-03-01, mostly REPLACED 2026-03-08)**: Three-layer filtering before treating speech as interruption: (1) backchannel regex (mhm, yeah, okay, sure, right, etc.), (2) `MIN_INTERRUPTION_WORDS=2`, (3) `MIN_INTERRUPTION_DURATION=0.5s`. Filtered speech causes zero audio disruption — playback continues uninterrupted, barge-in listener restarts. `462db4f` removed filters (2) and (3) and switched to pause/resume (V2b below); only the backchannel regex survives, now as the resume test inside the pause/verify loop of `voice_client.py` and `face_voice_client.py`.
+- **Barge-in V2b (pause/resume — IMPLEMENTED 2026-03-08 in `462db4f`, current)**: LiveKit/Pipecat pattern — PAUSE playback on VAD trigger, wait for ASR to confirm real words. If real speech → fully cancel. If noise/echo → resume playback. At HEAD: `AudioPlayer` has `pause()`/`resume()`/`cancel()` with a fade-out; the monitor waits for playback to start, pauses on speech start, waits up to `BARGE_IN_VERIFY_TIMEOUT=0.5s` for a line, cancels on sustained speech past the timeout or on a non-backchannel line, and resumes on a backchannel.
 - **Barge-in V2c (energy-gate, optional)**: For speaker-only use without WebRTC. RMS energy monitoring in audio callback — gate audio forwarding to Moonshine during playback. User voice near mic is louder than speaker echo. Only needed if speakers must be supported before WebRTC migration.
 - **Barge-in framework research**: Studied Pipecat v0.0.99+ (VAD start strategies, Smart Turn v3 default stop, 5 user mute strategies), LiveKit Agents (AEC warmup 3.0s, false-interruption pause/resume, min_interruption_words/duration), Vocode (mute_during_speech, backchannel regex filtering, interrupt_sensitivity). All rely on transport-layer WebRTC AEC — no framework provides standalone local AEC. See `docs/research-asr-turn-taking.md` for full analysis.
 - **No open-source AEC for local Python on Windows**: Evaluated speexdsp, webrtc-audio-processing, pyaec, PINTO0309/onnx-aec, Pipecat filters. None viable. WebRTC will handle AEC when we move to browser-based I/O.
-- **Single Vast.ai GPU**: All server models (LLM + TTS + MuseTalk) coexist on one RTX 4090 (~14-17GB total VRAM) in a single Docker container. Can scale by moving a service to a separate Vast.ai instance (change one URL).
+- **Single Vast.ai GPU**: All server models (LLM + TTS + MuseTalk) coexist on one RTX 4090 (~14-17GB total VRAM) in a single Docker container. Can scale by moving a service to a separate Vast.ai instance (change one URL). (Superseded: the full stack measured ~23.2 GiB and OOMed under cloning on one 4090 on 2026-08-16 — see the 24GB entry above — and since `6e1481d` the entrypoint places services across 1..N GPUs of one instance, verified on 2×4090 on 2026-08-23.)
 - **Latency budget**: 1.5-2.5s end-to-end from end of speech to first avatar response is acceptable.
 - **Docker base image**: Switched from `nvidia/cuda:12.1.1-devel` (~12GB) to `python:3.11-slim-bookworm` (1.07GB). Neither Fish Speech nor MuseTalk compile CUDA code — pre-compiled PyTorch wheels, mmcv ships pre-built wheels.
 - **S1-mini over Fish Speech v1.5**: v1.5 codebase is being deprecated. S1-mini uses a new DAC codec (replaces VQGAN), different API flags (`--decoder-checkpoint-path` + `--decoder-config-name modded_dac_vq`), and weights at `fishaudio/openaudio-s1-mini`. Checkpoint: model.pth (1.74GB) + codec.pth (1.87GB). 12GB VRAM recommended officially but actual usage ~4.9GB after warmup.
@@ -237,6 +301,7 @@ entrypoint's face block is non-fatal, so `deploy_stage2.py` cannot reach face co
 - **The base image's S2 source at `/app` shadows our pinned copy** — caught by a build assertion 2026-08-16. The base declares `WORKDIR /app` and `COPY . .`, so the whole v2.0.0-beta tree (including `fish_speech/`) sits there. Python puts the working directory first on `sys.path`, so *any* process started from `/app` imports the S2 `fish_speech` no matter which venv runs it — the exact `AutoTokenizer` code we are avoiding. `Dockerfile.stage4` now does `rm -rf /app` after installing `/opt/fish-speech`, and the build asserts `fish_speech.__file__` starts with `/opt/fish-speech/`. Relying on `supervisord`'s `directory=` alone is not enough; the shadowing copy has to be gone.
 - **MuseTalk dependency order is load-bearing — verified on a live instance 2026-08-15**: three separate steps silently drag `numpy` forward off MuseTalk's pinned 1.23.5, and every C extension built against 1.x then dies with `Unable to convert function return value to a Python type` — a pybind11/numpy ABI error that surfaces three imports deep inside `diffusers`, nowhere near its cause. The working sequence, in this exact order: torch → `requirements.txt` → openmim + mmengine → **`mmcv==2.0.1 --only-binary mmcv -f <cu118/torch2.0.0 index>`** → re-pin → `mmdet==3.1.0` → **`matplotlib==3.7.5`** → **`mmpose==1.1.0 --no-build-isolation`** → re-pin. Three traps: `-f` only *adds* an index so pip still prefers PyPI's sdist and builds mmcv from source without `nvcc`, producing a package with **no CUDA ops that reports success** — `--only-binary mmcv` is mandatory. Current matplotlib requires numpy>=1.25, so it must be pinned to 3.7.5. And `mmpose` builds from source with a `setup.py` that needs torch visible, which pip's build isolation hides — hence `--no-build-isolation`. A known-good 168-package freeze from the verified environment is at `docker/musetalk-freeze.txt`.
 - **MuseTalk venv pins torch 2.0.1 / cu118**: `mmcv==2.0.1` only publishes pre-built wheels for torch 2.0.x on cu118. On any newer torch, `mim` falls back to compiling from source, which needs `nvcc` that the Fish Speech runtime base image does not have. Do not "modernise" this pin without also solving mmcv. It is isolated in `/opt/musetalk-venv` and cannot affect the LLM (`/opt/llm-venv`) or TTS (`/app/.venv`) environments — that isolation is the reason four Python environments exist in one container.
+- **Face animation is gated behind `FACE_ENABLED` at five points, so a voice-only deploy never reaches face code** — checked at HEAD (`33517d1`): (1) deploy script — `deploy_face.py` passes `-e FACE_ENABLED=true` unless `--no-face` (`scripts/deploy_face.py:172,175`), while `deploy_stage2.py` never sets it; (2) entrypoint — defaults it to `false` and runs MuseTalk setup only when true (`docker/entrypoint_stage2.sh:129-214`), and likewise the MuseTalk warmup (`:280`); (3) supervisord — the musetalk program has `autostart=%(ENV_FACE_ENABLED)s` (`docker/supervisord.conf:49`); (4) orchestrator import — `FaceAnimationClient` is imported only when `FACE_ENABLED` (`server/src/api/server.py:38-47`); (5) per turn — face work runs only when `FACE_ENABLED`, a face client exists and `_active_avatar_id` is set (`server/src/api/server.py:403`; declared at `:40`).
 - **Face setup is non-fatal**: the `FACE_ENABLED` block in `entrypoint_stage2.sh` runs with `set +e` because face animation is optional, and a failed MuseTalk install must not abort the entrypoint before supervisord starts the LLM, TTS and orchestrator.
 - **Streaming lip sync is approximate by construction**: whisper's encoder attends globally over its 30s input, so each new audio chunk shifts encoder output at every position in the trailing segment — including positions backing frames already sent. Early frames of a response are computed against a mostly zero-padded future. Making streaming features match offline ones requires a fixed sliding window with explicit left context, which is a design change, not a constant to tune.
 
