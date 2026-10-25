@@ -53,6 +53,7 @@ DEFAULT_SERVER_URL = "ws://localhost:8000/ws"
 SESSION_THREAD_NAME = "face-voice-session"
 STDIN_THREAD_NAME = "face-voice-stdin"
 STDIN_READ_BYTES = 4096
+SHUTDOWN_TASK_ERROR_MESSAGE = "unhandled exception during session shutdown"
 
 # Barge-in pre-filter settings
 BACKCHANNEL_PATTERN = re.compile(
@@ -161,8 +162,26 @@ class FaceVoiceClient:
 
     def _run_session(self, session: asyncio.Task[None]) -> None:
         self._loop.run_until_complete(asyncio.wait([session]))
+        self._cancel_remaining_tasks()
         self._loop.run_until_complete(self._loop.shutdown_asyncgens())
         self._loop.run_until_complete(self._loop.shutdown_default_executor())
+
+    def _cancel_remaining_tasks(self) -> None:
+        remaining = asyncio.all_tasks(self._loop)
+        if not remaining:
+            return
+        for task in remaining:
+            task.cancel()
+        self._loop.run_until_complete(asyncio.gather(*remaining, return_exceptions=True))
+        for task in remaining:
+            self._report_shutdown_failure(task)
+
+    def _report_shutdown_failure(self, task: asyncio.Task) -> None:
+        if task.cancelled() or task.exception() is None:
+            return
+        self._loop.call_exception_handler(
+            {"message": SHUTDOWN_TASK_ERROR_MESSAGE, "exception": task.exception(), "task": task}
+        )
 
     def _run_window_until_session_ends(self, session: asyncio.Task[None], worker: threading.Thread) -> None:
         stop_session = True
