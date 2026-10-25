@@ -92,16 +92,19 @@ if [ "$TTS_ENGINE" = "higgs" ]; then
         exit 1
     fi
     echo ""
-    echo "[2/2] Downloading TTS model: ${HIGGS_MODEL} (expecting ${HIGGS_REVISION}) ..."
-    # Unpinned so refs/main is written (the server resolves main at start);
-    # the expected revision is asserted instead of forced.
+    echo "[2/2] Downloading TTS model: ${HIGGS_MODEL}@${HIGGS_REVISION} ..."
     /opt/higgs-venv/bin/python -c "
 from huggingface_hub import snapshot_download
+from pathlib import Path
 import os
-path = snapshot_download(os.environ['HIGGS_MODEL'], token=os.environ.get('HF_TOKEN'))
-expected = os.environ['HIGGS_REVISION']
-assert expected[:12] in path, f'weights drifted: {path} != {expected}'
-print('Higgs model download complete:', path)
+repo = os.environ['HIGGS_MODEL']
+path = Path(snapshot_download(repo, revision=os.environ['HIGGS_REVISION'], token=os.environ.get('HF_TOKEN')))
+refs = path.parent.parent / 'refs'
+refs.mkdir(exist_ok=True)
+(refs / 'main').write_text(path.name)
+resolved = Path(snapshot_download(repo, local_files_only=True))
+assert resolved == path, f'offline main resolves to {resolved}, not the pinned {path}'
+print('Higgs model pinned as main:', path)
 "
     /opt/higgs-venv/bin/sgl-omni check-gpu --json --strict \
         || echo "check-gpu reported warnings (see above) — continuing"
@@ -240,6 +243,9 @@ ldconfig
 # --- 5. Start all services via supervisord ---
 echo ""
 echo "Starting services via supervisord ..."
+if [ "$TTS_ENGINE" = "higgs" ]; then
+    export HF_HUB_OFFLINE=1
+fi
 /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
 
 # --- 6. Warmup TTS (torch.compile first-request penalty ~30-60s) ---
