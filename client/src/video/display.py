@@ -24,6 +24,7 @@ _DEFAULT_LIVE_FPS = 25
 _FRAME_BUFFER_MAX = 3000
 
 _WINDOW_NAME = "Avatar"
+_START_POLL_SECONDS = 0.05
 
 
 def pingpong_index(position: int, frame_count: int) -> int:
@@ -39,7 +40,7 @@ def pingpong_index(position: int, frame_count: int) -> int:
 
 
 class VideoDisplay:
-    """Thread-based OpenCV window; live pacing follows audio_position()."""
+    """OpenCV window; live pacing follows audio_position()."""
 
     def __init__(
         self,
@@ -57,25 +58,28 @@ class VideoDisplay:
         self._current_frame: np.ndarray | None = None
         self._running = False
         self._idle_mode = True
-        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     def start(self) -> None:
-        """Start the display thread and open the OpenCV window."""
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._display_loop, daemon=True)
-        self._thread.start()
         logger.info("VideoDisplay started")
 
     def stop(self) -> None:
-        """Stop the display thread and close the window."""
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
         logger.info("VideoDisplay stopped")
+
+    def run_window(self, session_alive: Callable[[], bool]) -> bool:
+        while not self._running:
+            if not session_alive():
+                return False
+            time.sleep(_START_POLL_SECONDS)
+        cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_NORMAL)
+        try:
+            return self._display_loop(session_alive)
+        finally:
+            cv2.destroyWindow(_WINDOW_NAME)
 
     @property
     def cursor(self) -> int:
@@ -151,12 +155,10 @@ class VideoDisplay:
             logger.warning("Failed to decode JPEG frame (%d bytes)", len(jpeg_bytes))
         return frame
 
-    def _display_loop(self) -> None:
-        """Main display thread loop — renders frames via cv2.imshow."""
-        cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    def _display_loop(self, session_alive: Callable[[], bool]) -> bool:
         last_idle_tick = time.monotonic()
 
-        while self._running:
+        while self._running and session_alive():
             now = time.monotonic()
             with self._lock:
                 idle = self._idle_mode
@@ -196,8 +198,7 @@ class VideoDisplay:
             key = cv2.waitKey(16) & 0xFF
             if key == 27:
                 self._running = False
-                break
+                return True
             if key != 255 and self._on_key is not None:
                 self._on_key(key)
-
-        cv2.destroyWindow(_WINDOW_NAME)
+        return False

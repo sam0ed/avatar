@@ -20,10 +20,13 @@ Usage:
 
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import logging
+import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -47,6 +50,9 @@ logging.basicConfig(
 )
 
 DEFAULT_SERVER_URL = "ws://localhost:8000/ws"
+SESSION_THREAD_NAME = "face-voice-session"
+STDIN_THREAD_NAME = "face-voice-stdin"
+STDIN_READ_BYTES = 4096
 
 # Barge-in pre-filter settings
 BACKCHANNEL_PATTERN = re.compile(
@@ -60,6 +66,24 @@ BARGE_IN_VERIFY_TIMEOUT = 0.5  # seconds
 def _is_backchannel(text: str) -> bool:
     """Check if text is a backchannel/filler that should not interrupt."""
     return bool(BACKCHANNEL_PATTERN.match(text.strip()))
+
+
+def _read_stdin_line(line: concurrent.futures.Future[str]) -> None:
+    if not line.set_running_or_notify_cancel():
+        return
+    try:
+        data = os.read(sys.stdin.fileno(), STDIN_READ_BYTES)
+        if not data:
+            raise EOFError
+        line.set_result(data.decode(sys.stdin.encoding, errors="replace"))
+    except Exception as error:
+        line.set_exception(error)
+
+
+async def _next_stdin_line() -> str:
+    line: concurrent.futures.Future[str] = concurrent.futures.Future()
+    threading.Thread(target=_read_stdin_line, args=(line,), name=STDIN_THREAD_NAME, daemon=True).start()
+    return await asyncio.wrap_future(line)
 
 
 class FaceVoiceClient:
@@ -113,14 +137,45 @@ class FaceVoiceClient:
             )
             self._output_mode_cls = OutputMode
         self._player = AudioPlayer(output_device=output_device)
+        self._loop = asyncio.new_event_loop()
         self._video_display = VideoDisplay(
             audio_position=lambda: self._player.played_seconds,
-            on_key=self._on_display_key,
+            on_key=self._post_display_key,
         )
         self._running = False
         self._use_smart_turn = use_smart_turn
         self._smart_turn = None  # SmartTurnAnalyzer, initialized in run()
         self._chat_seq = 0  # Incrementing chat ID for message correlation
+
+    def run_with_window(self) -> None:
+        session = self._loop.create_task(self.run())
+        worker = threading.Thread(target=self._run_session, args=(session,), name=SESSION_THREAD_NAME)
+        worker.start()
+        try:
+            self._run_window_until_session_ends(session, worker)
+        finally:
+            worker.join()
+            self._loop.close()
+        if not session.cancelled():
+            session.result()
+
+    def _run_session(self, session: asyncio.Task[None]) -> None:
+        self._loop.run_until_complete(asyncio.wait([session]))
+        self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        self._loop.run_until_complete(self._loop.shutdown_default_executor())
+
+    def _run_window_until_session_ends(self, session: asyncio.Task[None], worker: threading.Thread) -> None:
+        stop_session = True
+        try:
+            stop_session = self._video_display.run_window(worker.is_alive)
+        except KeyboardInterrupt:
+            logger.info("Interrupted, stopping the session")
+        finally:
+            if stop_session:
+                self._loop.call_soon_threadsafe(session.cancel)
+
+    def _post_display_key(self, key: int) -> None:
+        self._loop.call_soon_threadsafe(self._on_display_key, key)
 
     def _on_display_key(self, key: int) -> None:
         if self._router is not None and key in (ord("a"), ord("A")):
@@ -631,12 +686,9 @@ class FaceVoiceClient:
 
     async def _quit_listener(self, quit_event: asyncio.Event) -> None:
         """Listen for 'quit' typed on stdin."""
-        loop = asyncio.get_event_loop()
         try:
             while not quit_event.is_set():
-                user_input = await loop.run_in_executor(
-                    None, lambda: input()
-                )
+                user_input = await _next_stdin_line()
                 if user_input.strip().lower() in ("quit", "exit", "q"):
                     quit_event.set()
                     return
@@ -702,7 +754,7 @@ def main() -> None:
     )
 
     try:
-        asyncio.run(client.run())
+        client.run_with_window()
     except KeyboardInterrupt:
         pass
 
