@@ -35,52 +35,24 @@ Projects 2 and 3 get their own design documents. This one only prepares the grou
 
 ## Architecture
 
-### Platform selection: one enum, one factory, nothing more
+### Change only what breaks
 
-```
-client/src/host_platform.py    HostPlatform(StrEnum): WINDOWS = "win32", MACOS = "darwin"
-                               current_platform() -> HostPlatform(sys.platform)
-```
+Working code is not restructured for the port. The client changes only where macOS actually
+fails; abstractions for platform differences get built when a second implementation really
+exists, and as small as possible.
 
-`current_platform()` raises immediately on any other OS. Code that differs per platform is
-selected by `match` on the enum, and the platform module is imported inside the matching branch,
-so Windows-only packages are only ever imported on Windows.
-
-In this project the only platform-selected piece is meeting-audio capture:
-
-```
-client/src/output/
-  loopback.py            LoopbackSource Protocol + open_loopback() factory
-  loopback_windows.py    WASAPI loopback via pyaudiowpatch (today's capture code, moved unchanged)
-  meeting_ears.py        platform-neutral: thread, downmix, resample, 1600-sample blocks
-```
-
-The macOS loopback backend is project 2. Until then, `--meeting` and `--ears meeting` on macOS
-fail at startup with an explicit "not supported on macOS yet" error rather than a stack trace.
-
-Per-platform device names (VB-Cable on Windows, BlackHole on macOS) are data, not code: a table
-keyed by `HostPlatform`. The macOS entry is filled in by project 2.
-
-Rejected as over-engineering: plugin registries or entry points, base-class hierarchies, wrappers
-around pyvirtualcam/sounddevice/cv2, separate per-OS packages, CI (deferred by decision).
+The meeting modules stay as they are. They are imported only under `--meeting` / `--ears meeting`,
+so the rest of the client never reaches `pyaudiowpatch` on macOS. The macOS meeting path is
+project 2.
 
 ### Dependencies and the lockfile
 
 ```toml
 dependencies = [ ..., "pyaudiowpatch>=0.2.12.8; sys_platform == 'win32'", ... ]
-
-[tool.uv]
-environments = ["sys_platform == 'win32'", "sys_platform == 'darwin'"]
-required-environments = [
-    "sys_platform == 'win32' and platform_machine == 'AMD64'",
-    "sys_platform == 'darwin' and platform_machine == 'arm64'",
-]
 ```
 
-`client/uv.lock` is committed (un-ignored for `client/`). `required-environments` makes `uv lock`
-on the Mac fail if any dependency stops shipping a Windows x64 or macOS arm64 wheel: the cheapest
-available guard for the untested platform. Dependencies added later for macOS only (pyobjc,
-`catap`) get a `sys_platform == 'darwin'` marker.
+`client/uv.lock` is committed (un-ignored for `client/`). Dependencies added later for macOS only
+(pyobjc, `catap`) get a `sys_platform == 'darwin'` marker.
 
 ### The window owns the main thread
 
@@ -148,44 +120,37 @@ Every entry point must start and do its job on macOS:
 |---|---|---|
 | `face_voice_client.py` | main client | the window restructure; AEC |
 | `voice_client.py` | voice only | AEC |
-| `chat_client.py`, `tts_test.py`, `connectivity_test.py` | take their target from CLI args | verify only |
-| `latency_test.py`, `client/test_ws.py`, `client/test_llm_client.py` | hardcode `localhost` or Feb 2026 instance IPs | take the target as a CLI argument |
+| `chat_client.py`, `tts_test.py`, `connectivity_test.py`, `latency_test.py` | no platform-bound code | verify they start |
+| `client/test_ws.py`, `client/test_llm_client.py` | legacy debug scripts, hardcoded Feb 2026 instance IPs | unchanged; broken on every platform, not a macOS issue |
 
 ## Sequencing
 
 Each step ends with something runnable and is committed separately, with the commit message saying
 what was run.
 
-1. **Install**: the `pyaudiowpatch` marker, `environments`/`required-environments`, committed
-   `client/uv.lock`. Done when `uv sync --locked` passes on the Mac and `uv lock` resolves both
-   platforms.
-2. **Platform split**: `HostPlatform`, the loopback Protocol and factory, the Windows backend moved
-   unchanged, the fail-fast error for meeting flags on macOS, the device-name table.
-3. **Window on the main thread**: the restructure above, on both platforms.
-4. **Headphone smoke test** (needs a deployed server, approved by the user before it is rented):
+1. **Install**: the `pyaudiowpatch` marker and a committed `client/uv.lock`. Done when
+   `uv sync --locked` passes on the Mac.
+2. **Window on the main thread**: the restructure above, on both platforms.
+3. **Headphone smoke test** (needs a deployed server, approved by the user before it is rented):
    a full spoken conversation on the Mac with headphones, idle and talking video, barge-in;
    first audio and first video measured. Host egress is measured first, because a thin route
    (the 2026-08-24 finding) would masquerade as a client regression.
-5. **Every entry point** runs on macOS, including the scripts that need a CLI target.
-6. **AEC spike**: both candidates, four checks, numbers reported.
-7. **AEC built** for the winner, with the flag, defaults and self-test.
-8. **Speaker test**: the same conversation as step 4 on the MacBook's built-in speakers, barge-in
+4. **Every entry point** in the table above starts on macOS.
+5. **AEC spike**: both candidates, four checks, numbers reported.
+6. **AEC built** for the winner, with the flag, defaults and self-test.
+7. **Speaker test**: the same conversation as step 3 on the MacBook's built-in speakers, barge-in
    included.
-9. **AGENTS.md** updated in the same commit as the stage move: drafted by one subagent, checked
+8. **AGENTS.md** updated in the same commit as the stage move: drafted by one subagent, checked
    line by line by a second, diff approved by the user.
 
 ## Testing
 
-- Unit tests (new `client/tests/`, pytest): platform selection (supported and unsupported
-  `sys.platform` values), the platform-neutral half of meeting ears (downmix, resample, 1600-sample
-  blocking), the key hand-off from the window loop to the event loop, and whichever AEC glue is
-  built (reference alignment for WebRTC, channel selection for Apple VP).
-- An import smoke test that imports every client module except platform modules for the other OS.
-- Live, on the Mac: steps 4, 5 and 8 above. First audio and first video within about 10% of the
+- No automated tests: verification is by running the real thing, and each commit says what was
+  run.
+- Live, on the Mac: steps 3, 4 and 7 above. First audio and first video within about 10% of the
   baseline on a comparable host is the sanity check; more than that is investigated, not accepted.
-- Windows: not run. `uv lock` covering both platforms and keeping Windows code behind the same
-  interfaces is the whole safety net; commit messages and AGENTS.md say "Windows path not
-  re-verified" wherever Windows code was touched.
+- Windows: not run. Commit messages and AGENTS.md say "Windows path not re-verified" wherever
+  code shared with Windows was touched.
 
 ## Out of scope
 
@@ -207,5 +172,5 @@ what was run.
   reporting that has to be recalibrated, macOS 27 deprecations of the non-`error:` engine calls.
 - **WebRTC AEC3, if it wins**: reference alignment against the real device latency; near-end
   suppression at session start weakens the first barge-in.
-- **Untested Windows**: the restructured window loop and the moved loopback code are not run on
-  Windows until someone has a Windows machine at hand.
+- **Untested Windows**: the restructured window loop is not run on Windows until someone has a
+  Windows machine at hand.
